@@ -26,6 +26,10 @@ sys.path.insert(0, REPO)
 
 from kicad_parser import parse_kicad_pcb  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kicad_rules_fixtures import (KICAD_CLI, actual_mm, check_connected,  # noqa: E402
+                                  kicad_drc, violation_nets)
+
 BOARD = os.path.join(REPO, "kicad_files", "routed_output.kicad_pcb")
 BOARD_PRO = os.path.join(REPO, "kicad_files", "routed_output.kicad_pro")
 LIBDIR = "/nix/store/0ba5kj6r0zhfwd84l5vzccqvx7amlq2c-gcc-15.3.0-lib/lib"
@@ -270,6 +274,30 @@ def test_default_path_untouched(tmp_path):
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     assert "KiCad rules" not in proc.stdout
     assert _counts(proc) == BASELINE_COUNTS
+
+
+# Fab floor for 4+ layers. The engine's partner-graze neck can shrink a
+# stub-to-pair connector to it, below this board's min_track_width (0.09); see
+# docs/configuration.md "Known limitations" (diff-pair neck). Parked engine issue.
+NECK_FLOOR = 0.0889
+
+
+@pytest.mark.skipif(KICAD_CLI is None, reason="kicad-cli not installed")
+def test_kicad_drc_clean_on_routed_nets(routed):
+    nets = list(PAIR_NETS["LVDS"])
+    viols = kicad_drc(routed)
+    clr = [v for v in viols if v["type"] == "clearance" and violation_nets(v, nets)]
+    assert clr == [], clr
+    tw = [v for v in viols if v["type"] == "track_width" and violation_nets(v, nets)]
+    # only the known neck is allowed: anything wider than the fab floor fails
+    bad = [v for v in tw if actual_mm(v) is None or actual_mm(v) > NECK_FLOOR + 1e-4]
+    assert bad == [], bad
+
+
+def test_routed_nets_connected(routed):
+    proc = check_connected(routed, list(PAIR_NETS["LVDS"]), _env())
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert "ALL NETS FULLY CONNECTED" in proc.stdout
 
 
 def test_gap_below_pair_clearance_warns(tmp_path, capsys):

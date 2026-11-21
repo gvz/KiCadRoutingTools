@@ -23,6 +23,10 @@ sys.path.insert(0, REPO)
 
 from kicad_parser import parse_kicad_pcb  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kicad_rules_fixtures import (KICAD_CLI, check_connected, kicad_drc,  # noqa: E402
+                                  violation_nets)
+
 BOARD = os.path.join(REPO, "kicad_files", "flat_hierarchy.kicad_pcb")
 BOARD_PRO = os.path.join(REPO, "kicad_files", "flat_hierarchy.kicad_pro")
 LIBDIR = "/nix/store/0ba5kj6r0zhfwd84l5vzccqvx7amlq2c-gcc-15.3.0-lib/lib"
@@ -254,6 +258,21 @@ def test_length_and_group_skew_report(routed_run):
         assert re.search(re.escape(net) + r"\s+[\d.]+\s+-\s+1\s+FAIL", out), net
     assert re.search(r"rule 'wide_match': group skew across all matched nets "
                      r"\(2 nets\): [\d.]+ vs 0\.01 (PASS|FAIL)", out)
+
+
+@pytest.mark.skipif(KICAD_CLI is None, reason="kicad-cli not installed")
+def test_kicad_drc_clean_on_routed_nets(routed):
+    viols = kicad_drc(routed)
+    clr = [v for v in viols if v["type"] == "clearance" and violation_nets(v, ROUTE_NETS)]
+    tw = [v for v in viols if v["type"] == "track_width" and violation_nets(v, ROUTE_NETS)]
+    assert clr == [], clr
+    assert tw == [], tw
+
+
+def test_routed_nets_connected(routed):
+    proc = check_connected(routed, ROUTE_NETS, _env())
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    assert "ALL NETS FULLY CONNECTED" in proc.stdout
 
 
 def test_explicit_flags_from_argv():
