@@ -146,3 +146,53 @@ def test_print_report(rules, tmp_path, capsys):
     r2.print_report(["x"])
     assert "warning" in capsys.readouterr().out.lower()
 
+
+
+SKIP_DRU = '''(version 1)
+(rule "lay2" (layer outer) (condition "A.NetClass == 'MDI' && B.NetClass == 'CHASSIS'")
+  (constraint clearance (min 2)))
+(rule "tw2" (condition "A.NetClass == 'MDI' && B.NetClass == 'CHASSIS'")
+  (constraint track_width (opt 0.5)))
+(rule "maxonly" (condition "A.NetClass == 'MDI'") (constraint clearance (max 3)))
+(rule "good" (condition "A.NetClass == 'MDI'") (constraint clearance (min 0.4)))
+'''
+
+
+def test_skipped_rules_reported(tmp_path, capsys):
+    r = make_rules(tmp_path, [{"name": "Default"}, {"name": "MDI"}],
+                   dru=SKIP_DRU)
+    for name in ("lay2", "tw2", "maxonly"):
+        assert any(f"'{name}'" in i for i in r.report_items), name
+    assert not any("'good'" in i for i in r.report_items)
+    r.print_report([])
+    out = capsys.readouterr().out
+    for name in ("lay2", "tw2", "maxonly"):
+        assert name in out
+    applied = [l for l in out.splitlines() if "applied rules" in l][0]
+    assert "good" in applied and "lay2" not in applied and "tw2" not in applied
+
+
+def test_clearance_cached_by_signature(rules_mdi, monkeypatch):
+    import kicad_rules
+    first = rules_mdi.clearance("ETH_A_P", "SHIELD")
+    calls = []
+    real = kicad_rules.eval_condition
+    monkeypatch.setattr(kicad_rules, "eval_condition",
+                        lambda *a: calls.append(1) or real(*a))
+    assert rules_mdi.clearance("ETH_A_P", "SHIELD") == first
+    assert rules_mdi.clearance("SHIELD", "ETH_A_P") == first
+    assert rules_mdi.clearance("ETH_B_N", "SHIELD") == first   # equal signature
+    assert calls == []
+
+
+def test_netparams_frozen(rules):
+    with pytest.raises(Exception):
+        rules.net_params("x").track_width = 1.0
+
+
+def test_missing_cli_keys_filled(tmp_path):
+    pro = write_pro(tmp_path, classes=None)
+    r = BoardRules.load(pro[:-len(".kicad_pro")] + ".kicad_pcb", {})
+    p = r.net_params("x")
+    assert p.track_width > 0 and r.clearance("a", "b") > 0
+    assert any("cli_defaults" in w for w in r.warnings)

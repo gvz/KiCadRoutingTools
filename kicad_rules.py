@@ -453,7 +453,7 @@ def eval_condition(rule: DruRule, a: ItemInfo, b: Optional[ItemInfo]) -> bool:
 _CLI_KEYS = ('clearance', 'track_width', 'via_size', 'via_drill', 'diff_pair_gap')
 
 
-@dataclass
+@dataclass(frozen=True)
 class NetParams:
     net_class: str
     track_width: float
@@ -487,9 +487,20 @@ class BoardRules:
                  cli_defaults: Dict[str, float]):
         self.project = project
         self.dru_rules = dru_rules
-        self.cli = dict(cli_defaults)
+        self._clr_memo: Dict[frozenset, float] = {}
+        self._applied: List[str] = []
         self._warn: List[str] = []
         self._warned = set()
+        import routing_defaults as _rd
+        fallback = {'clearance': _rd.CLEARANCE, 'track_width': _rd.TRACK_WIDTH,
+                    'via_size': _rd.VIA_SIZE, 'via_drill': _rd.VIA_DRILL,
+                    'diff_pair_gap': _rd.DIFF_PAIR_GAP}
+        self.cli = dict(cli_defaults)
+        for k in _CLI_KEYS:
+            if self.cli.get(k) is None:
+                self.cli[k] = fallback[k]
+                self._warn_once('cli:' + k, f"cli_defaults lacks '{k}'; "
+                                f"using routing default {fallback[k]:g}")
         self.report_items: List[str] = []
         self.unsupported: List[Tuple[str, str]] = []
         self.drc_only: List[str] = []
@@ -503,9 +514,26 @@ class BoardRules:
             if any(k not in ROUTING_KINDS and k not in MATCH_KINDS
                    for k in rule.constraints):
                 self.drc_only.append(rule.name)
-            if rule.layer is None and rule.constraints.get('clearance') is not None \
-                    and rule.constraints['clearance'].value() is not None:
-                self._clr_rules.append(rule)
+            used = False
+            for kind, con in rule.constraints.items():
+                if kind not in ROUTING_KINDS and kind not in MATCH_KINDS:
+                    continue
+                reason = None
+                if kind in ROUTING_KINDS and con.value() is None:
+                    reason = "max-only constraint (router uses opt or min)"
+                elif rule.layer is not None:
+                    reason = f"restricted to layer '{rule.layer}'"
+                elif rule.uses_b and kind != 'clearance':
+                    reason = "two-object (A/B) condition not supported for this constraint"
+                if reason is not None:
+                    self.report_items.append(
+                        f"rule '{rule.name}' {kind} not applied: {reason}")
+                    continue
+                used = True
+                if kind == 'clearance':
+                    self._clr_rules.append(rule)
+            if used:
+                self._applied.append(rule.name)
         if 'Default' not in project.classes:
             self._warn_once('default', "no 'Default' net class in project; "
                             "using command-line defaults for unset values")
@@ -561,11 +589,7 @@ class BoardRules:
             if not eval_condition(rule, item, None):
                 continue
             if rule.layer is not None:
-                msg = (f"rule '{rule.name}' is restricted to layer '{rule.layer}'; "
-                       "not applied to routing values")
-                if msg not in self.report_items:
-                    self.report_items.append(msg)
-                continue
+                continue  # reported once in __init__
             for kind, con in rule.constraints.items():
                 if kind in ROUTING_KINDS and con.value() is not None:
                     found[kind] = con.value()
@@ -603,6 +627,9 @@ class BoardRules:
         return v if v is not None else self.cli['clearance']
 
     def clearance(self, net_a: str, net_b: str) -> float:
+        key = frozenset((self.signature(net_a), self.signature(net_b)))
+        if key in self._clr_memo:
+            return self._clr_memo[key]
         a, b = self._item(net_a), self._item(net_b)
         result = max(self._class_clearance(a.net_class),
                      self._class_clearance(b.net_class))
@@ -613,7 +640,9 @@ class BoardRules:
                 hit = eval_condition(rule, a, None) or eval_condition(rule, b, None)
             if hit:
                 result = rule.constraints['clearance'].value()
-        return max(result, self.project.board_min.get('min_clearance', 0.0))
+        result = max(result, self.project.board_min.get('min_clearance', 0.0))
+        self._clr_memo[key] = result
+        return result
 
     # -- grouping ---------------------------------------------------------
 
@@ -666,12 +695,12 @@ class BoardRules:
                   f"via {p.via_size:g}/{p.via_drill:g}, "
                   f"diff pair {p.diff_pair_width:g}/{p.diff_pair_gap:g}, "
                   f"clearance {self._class_clearance(cname):g}")
-        applied = [r.name for r in self.dru_rules if r.supported and any(
-            k in ROUTING_KINDS or k in MATCH_KINDS for k in r.constraints)]
-        if applied:
-            print("  applied rules: " + ", ".join(applied))
-        for item in self.report_items:
-            print(f"  note: {item}")
+        if self._applied:
+            print("  applied rules: " + ", ".join(self._applied))
+        if self.report_items:
+            print("  skipped constraints:")
+            for item in self.report_items:
+                print(f"    {item}")
         for name, reason in self.unsupported:
             print(f"  unsupported rule '{name}': {reason}")
         if self.drc_only:
