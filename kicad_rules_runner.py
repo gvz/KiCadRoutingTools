@@ -1,4 +1,4 @@
-"""`route.py --kicad-rules`: route nets group by group with KiCad's own rules.
+"""`route.py` / `route_diff.py --kicad-rules`: route group by group with KiCad's own rules.
 
 The board's sibling .kicad_pro / .kicad_dru (read by kicad_rules.BoardRules)
 decide each group's track width, via size/drill and clearance. Groups are routed
@@ -8,7 +8,8 @@ group's clearances. Earlier groups' copper is fixed (no rip-up across groups).
 """
 import os
 import shutil
-from typing import Dict, List, Set, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from kicad_rules import BoardRules
 
@@ -33,19 +34,24 @@ def _net_names_by_id(pcb_file: str) -> Dict[int, str]:
     return {nid: (net.name or "") for nid, net in pcb.nets.items()}
 
 
-def make_clearance_fn(rules: BoardRules, rep: str, names_by_id: Dict[int, str]):
+def make_clearance_fn(rules: BoardRules, rep: str, names_by_id: Dict[int, str],
+                      partners: Sequence[str] = ()):
     """Obstacle hook: clearance between group representative `rep` and net `nid`.
 
-    Net 0 and ids not in the board resolve as name "" (the Default class).
-    Memoised per net id; the hook runs once per stamped segment/via/pad.
+    With `partners` (a diff pair's N net), the hook returns the larger of the
+    clearances of `rep` and each partner to `nid`, so a pair whose halves sit in
+    different classes keeps the stricter one. Net 0 and ids not in the board
+    resolve as name "" (the Default class). Memoised per net id; the hook runs
+    once per stamped segment/via/pad.
     """
+    reps = (rep,) + tuple(x for x in partners if x != rep)
     memo: Dict[int, float] = {}
 
     def fn(nid: int) -> float:
         v = memo.get(nid)
         if v is None:
             name = names_by_id.get(nid, "") if nid else ""
-            v = memo[nid] = rules.clearance(rep, name)
+            v = memo[nid] = max(rules.clearance(r, name) for r in reps)
         return v
     return fn
 
@@ -74,6 +80,92 @@ def _fmt(v) -> str:
     return f"{v:g}" if isinstance(v, (int, float)) else str(v)
 
 
+# ---------------------------------------------------------------------------
+# Shared machinery for route.py and route_diff.py
+# ---------------------------------------------------------------------------
+
+# Rule values the fab floor applies to (enforce_fab_floors' params).
+_FLOOR_KEYS = ('track_width', 'via_size', 'via_drill', 'clearance')
+
+
+def _load_rules(input_file: str, kwargs: dict, net_names: List[str]) -> BoardRules:
+    """BoardRules from the input's sibling project files; prints the start report."""
+    import routing_defaults as defaults
+    cli_defaults = {k: kwargs.get(k) for k in _RULE_KEYS}
+    cli_defaults['diff_pair_gap'] = kwargs.get('diff_pair_gap', defaults.DIFF_PAIR_GAP)
+    rules = BoardRules.load(input_file, cli_defaults)
+    rules.print_report(net_names)
+    return rules
+
+
+def _group_kwargs(base_kwargs: dict, rule_vals: dict, explicit_flags: Set[str],
+                  n_layers: int) -> dict:
+    """base_kwargs with rule_vals applied; explicit flags keep their CLI value.
+
+    Rule geometry below the fab floor is pinned up like typed values (warned);
+    each explicit override is printed.
+    """
+    from fab_tiers import enforce_fab_floors
+    rule_vals = dict(rule_vals)
+    for k, floor in enforce_fab_floors(
+            n_layers, **{k: v for k, v in rule_vals.items()
+                         if k in _FLOOR_KEYS and k not in explicit_flags}).items():
+        rule_vals[k] = floor
+    kw = dict(base_kwargs)
+    for k, v in rule_vals.items():
+        if k in explicit_flags:
+            print(f"override: {k}={_fmt(base_kwargs[k])} (rules say {_fmt(v)})")
+        else:
+            kw[k] = v
+    return kw
+
+
+def _hook_for(rules: BoardRules, rep: str, pcb_file: str, explicit_flags: Set[str],
+              partners: Sequence[str] = ()):
+    if 'clearance' in explicit_flags:
+        return None  # an explicit --clearance applies to every net pair
+    return make_clearance_fn(rules, rep, _net_names_by_id(pcb_file), partners)
+
+
+def _run_chain(input_file: str, output_file: str, n_groups: int,
+               route_group: Callable[[int, str, str], Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Run `route_group(index, in_file, out_file)` for each group through a chain
+    of intermediate boards ending at output_file. Intermediates are removed and
+    the input's .kicad_pro/.kicad_dru are copied beside the output."""
+    if n_groups == 0:
+        return []
+    paths = chain_paths(output_file, n_groups)
+    results = []
+    in_i = input_file
+    try:
+        for gi, out_i in enumerate(paths):
+            results.append(route_group(gi, in_i, out_i))
+            in_i = out_i
+    finally:
+        for path in paths[:-1]:
+            if os.path.abspath(path) != os.path.abspath(output_file):
+                _remove_intermediate(path)
+    if os.path.isfile(output_file):
+        _copy_project_files(input_file, output_file)
+    return results
+
+
+def _print_summary(labels: List[Tuple[str, int]], results: List[Tuple[int, int]],
+                   unit: str) -> Tuple[int, int]:
+    print("\nKiCad rules routing summary:")
+    n = len(labels)
+    for gi, ((cname, count), (ok, fail)) in enumerate(zip(labels, results), 1):
+        print(f"  group {gi}/{n} ({cname}, {count} {unit}): routed {ok}, failed {fail}")
+    total_ok = sum(r[0] for r in results)
+    total_fail = sum(r[1] for r in results)
+    print(f"  total: routed {total_ok}, failed {total_fail}")
+    return total_ok, total_fail
+
+
+# ---------------------------------------------------------------------------
+# route.py --kicad-rules
+# ---------------------------------------------------------------------------
+
 def run_route_with_rules(input_file: str, output_file: str, net_names: List[str],
                          route_kwargs: dict, explicit_flags: Set[str],
                          batch_route_fn=None) -> Tuple[int, int]:
@@ -87,67 +179,220 @@ def run_route_with_rules(input_file: str, output_file: str, net_names: List[str]
     """
     if batch_route_fn is None:
         from route import batch_route as batch_route_fn
-    from fab_tiers import enforce_fab_floors, count_copper_layers_in_file
-    import routing_defaults as defaults
+    from fab_tiers import count_copper_layers_in_file
 
-    cli_defaults = {k: route_kwargs.get(k) for k in _RULE_KEYS}
-    cli_defaults['diff_pair_gap'] = route_kwargs.get('diff_pair_gap', defaults.DIFF_PAIR_GAP)
-    rules = BoardRules.load(input_file, cli_defaults)
-    rules.print_report(net_names)
-
+    rules = _load_rules(input_file, route_kwargs, net_names)
     if route_kwargs.get('rip_existing_nets'):
         print("  note: --rip-existing-nets is ignored with --kicad-rules "
               "(rip-up stays inside each rule group)")
 
     groups = rules.group_nets(net_names)
-    paths = chain_paths(output_file, len(groups))
     n_layers = count_copper_layers_in_file(input_file)
-    summary = []
-    total_ok = total_fail = 0
-    in_i = input_file
-    try:
-        for gi, (group, out_i) in enumerate(zip(groups, paths), 1):
-            rep = group[0]
-            p = rules.net_params(rep)
-            rule_vals = {'track_width': p.track_width, 'via_size': p.via_size,
-                         'via_drill': p.via_drill, 'clearance': rules.clearance(rep, rep)}
-            # The fab can't make sub-floor geometry; pin rule values like CLI ones.
-            for k, floor in enforce_fab_floors(
-                    n_layers, **{k: v for k, v in rule_vals.items()
-                                 if k not in explicit_flags}).items():
-                rule_vals[k] = floor
-            kw = dict(route_kwargs)
-            for k, v in rule_vals.items():
-                if k in explicit_flags:
-                    print(f"override: {k}={_fmt(route_kwargs[k])} (rules say {_fmt(v)})")
-                else:
-                    kw[k] = v
-            if 'clearance' in explicit_flags:
-                hook = None  # an explicit --clearance applies to every net pair
-            else:
-                hook = make_clearance_fn(rules, rep, _net_names_by_id(in_i))
-            kw['obstacle_clearance_fn'] = hook
-            kw['rip_existing_nets'] = None
-            print(f"\n=== KiCad rules group {gi}/{len(groups)}: class {p.net_class}, "
-                  f"{len(group)} nets, track {_fmt(kw['track_width'])}, "
-                  f"via {_fmt(kw['via_size'])}/{_fmt(kw['via_drill'])}, "
-                  f"clearance {_fmt(kw['clearance'])} ===")
-            res = batch_route_fn(in_i, out_i, group, **kw)
-            ok, fail = res[0], res[1]
-            total_ok += ok
-            total_fail += fail
-            summary.append((p.net_class, len(group), ok, fail))
-            in_i = out_i
-    finally:
-        for path in paths[:-1]:
-            if os.path.abspath(path) != os.path.abspath(output_file):
-                _remove_intermediate(path)
+    labels = []
 
-    if os.path.isfile(output_file):
-        _copy_project_files(input_file, output_file)
+    def route_group(gi, in_i, out_i):
+        group = groups[gi]
+        rep = group[0]
+        p = rules.net_params(rep)
+        labels.append((p.net_class, len(group)))
+        kw = _group_kwargs(route_kwargs,
+                           {'track_width': p.track_width, 'via_size': p.via_size,
+                            'via_drill': p.via_drill, 'clearance': rules.clearance(rep, rep)},
+                           explicit_flags, n_layers)
+        kw['obstacle_clearance_fn'] = _hook_for(rules, rep, in_i, explicit_flags)
+        kw['rip_existing_nets'] = None
+        print(f"\n=== KiCad rules group {gi + 1}/{len(groups)}: class {p.net_class}, "
+              f"{len(group)} nets, track {_fmt(kw['track_width'])}, "
+              f"via {_fmt(kw['via_size'])}/{_fmt(kw['via_drill'])}, "
+              f"clearance {_fmt(kw['clearance'])} ===")
+        res = batch_route_fn(in_i, out_i, group, **kw)
+        return res[0], res[1]
 
-    print("\nKiCad rules routing summary:")
-    for gi, (cname, n, ok, fail) in enumerate(summary, 1):
-        print(f"  group {gi}/{len(groups)} ({cname}, {n} nets): routed {ok}, failed {fail}")
-    print(f"  total: routed {total_ok}, failed {total_fail}")
-    return total_ok, total_fail
+    results = _run_chain(input_file, output_file, len(groups), route_group)
+    return _print_summary(labels, results, "nets")
+
+
+# ---------------------------------------------------------------------------
+# route_diff.py --kicad-rules
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PairParams:
+    """A diff pair's routing values: the stricter of its P and N nets."""
+    label: str           # class name, "P/N" classes when they differ
+    width: float
+    gap: float
+    via_size: float
+    via_drill: float
+    clearance: float
+    skew_max: Optional[float]
+    length_min: Optional[float]
+    length_max: Optional[float]
+
+
+def _opt(fn, values):
+    vals = [v for v in values if v is not None]
+    return fn(vals) if vals else None
+
+
+def pair_params(rules: BoardRules, p_net: str, n_net: str, base: str = "") -> PairParams:
+    """Stricter of P and N: max width/gap/via/clearance, min skew, the tighter
+    length window (larger min, smaller max). Warns when the classes differ."""
+    a, b = rules.net_params(p_net), rules.net_params(n_net)
+    name = base or f"{p_net}/{n_net}"
+    if a.net_class != b.net_class:
+        print(f"  warning: pair {name}: P in class '{a.net_class}', N in class "
+              f"'{b.net_class}' (different classes); using the stricter values of both")
+    widths = []
+    for x in (a, b):
+        if x.diff_pair_width > 0:
+            widths.append(x.diff_pair_width)
+        else:
+            print(f"  note: class '{x.net_class}' has no diff pair width; "
+                  f"using its track width {x.track_width:g}")
+            widths.append(x.track_width)
+    gaps = []
+    for x in (a, b):
+        if x.diff_pair_gap > 0:
+            gaps.append(x.diff_pair_gap)
+        else:
+            print(f"  note: class '{x.net_class}' has no diff pair gap; "
+                  f"using --diff-pair-gap {rules.cli['diff_pair_gap']:g}")
+            gaps.append(rules.cli['diff_pair_gap'])
+    label = a.net_class if a.net_class == b.net_class else f"{a.net_class}/{b.net_class}"
+    return PairParams(
+        label=label, width=max(widths), gap=max(gaps),
+        via_size=max(a.via_size, b.via_size), via_drill=max(a.via_drill, b.via_drill),
+        clearance=max(rules.clearance(p_net, p_net), rules.clearance(n_net, n_net)),
+        skew_max=_opt(min, (a.skew_max, b.skew_max)),
+        length_min=_opt(max, (a.length_min, b.length_min)),
+        length_max=_opt(min, (a.length_max, b.length_max)))
+
+
+def _print_length_table(rules: BoardRules, output_file: str,
+                        pairs: List[Tuple[str, str, str, PairParams]]) -> None:
+    """Per-net routed length vs the pair's length window, then per-pair skew,
+    measured on the final board; then the DRC-only rule list."""
+    from kicad_parser import parse_kicad_pcb
+    from net_queries import calculate_route_length
+    print(f"\nLength check (KiCad length/skew rules) on {output_file}:")
+    if not os.path.isfile(output_file):
+        print("  (no output board; skipped)")
+    else:
+        pcb = parse_kicad_pcb(output_file)
+        ids = {n.name: nid for nid, n in pcb.nets.items() if n.name}
+
+        def length(name):
+            nid = ids.get(name)
+            if nid is None:
+                return 0.0
+            return calculate_route_length([s for s in pcb.segments if s.net_id == nid],
+                                          [v for v in pcb.vias if v.net_id == nid], pcb)
+
+        def lim(v):
+            return '-' if v is None else _fmt(v)
+
+        w = max([len(n) for _, p, nn, _ in pairs for n in (p, nn)] + [3])
+        print(f"  {'net':<{w}} {'length':>9} {'min':>6} {'max':>6} result")
+        skews = []
+        for base, p_net, n_net, pp in pairs:
+            lens = []
+            for name in (p_net, n_net):
+                L = length(name)
+                lens.append(L)
+                ok = ((pp.length_min is None or L >= pp.length_min - 1e-6)
+                      and (pp.length_max is None or L <= pp.length_max + 1e-6))
+                print(f"  {name:<{w}} {L:9.3f} {lim(pp.length_min):>6} "
+                      f"{lim(pp.length_max):>6} {'PASS' if ok else 'FAIL'}")
+            skews.append((base, abs(lens[0] - lens[1]), pp.skew_max))
+        for base, d, smax in skews:
+            if smax is not None:
+                res = 'PASS' if d <= smax + 1e-6 else 'FAIL'
+                print(f"  pair {base}: skew {d:.3f} (max {_fmt(smax)}) {res}")
+    if rules.drc_only:
+        print("  DRC-only rules (not used for routing): " + ", ".join(rules.drc_only))
+    else:
+        print("  no DRC-only rules")
+
+
+def run_diff_with_rules(input_file: str, output_file: str, net_names: List[str],
+                        diff_kwargs: dict, explicit_flags: Set[str],
+                        batch_route_fn=None) -> Tuple[int, int]:
+    """Route the diff pairs among `net_names` per KiCad rule group.
+
+    Returns (total routed, total failed). Pairs are grouped by the rule
+    signatures of their P and N nets; each group is one batch_route_diff_pairs
+    call with the pair's stricter-of-P/N width, gap, vias and clearance, plus
+    intra-pair matching to the skew limit when a skew rule applies. Keys in
+    `explicit_flags` keep their diff_kwargs value (printed); an explicit
+    --impedance keeps its computed width. After routing, prints a per-net length
+    table against the length rules and the DRC-only rule list.
+    """
+    if batch_route_fn is None:
+        from route_diff import batch_route_diff_pairs as batch_route_fn
+    from fab_tiers import count_copper_layers_in_file
+    from kicad_parser import parse_kicad_pcb
+    from net_queries import find_differential_pairs
+
+    rules = _load_rules(input_file, diff_kwargs, net_names)
+    found = find_differential_pairs(parse_kicad_pcb(input_file), net_names)
+    pairs = []  # (base, P, N, PairParams)
+    for base, dp in found.items():
+        if dp.is_complete:
+            pairs.append((base, dp.p_net_name, dp.n_net_name,
+                          pair_params(rules, dp.p_net_name, dp.n_net_name, base)))
+    paired = {n for _, p, nn, _ in pairs for n in (p, nn)}
+    loose = [n for n in net_names if n not in paired]
+    if loose:
+        print(f"  note: {len(loose)} net(s) are not in a P/N pair and are not "
+              f"routed with --kicad-rules: {', '.join(loose[:5])}"
+              f"{'...' if len(loose) > 5 else ''}")
+
+    # Group by (signature(P), signature(N)); order groups like group_nets orders P.
+    by_sig: Dict[Tuple, list] = {}
+    for item in pairs:
+        by_sig.setdefault((rules.signature(item[1]), rules.signature(item[2])), []).append(item)
+    p_order = rules.group_nets([item[1] for item in pairs])
+    rank = {n: i for i, g in enumerate(p_order) for n in g}
+    groups = sorted(by_sig.values(), key=lambda g: rank[g[0][1]])
+
+    n_layers = count_copper_layers_in_file(input_file)
+    impedance = diff_kwargs.get('impedance')
+    labels = []
+
+    def route_group(gi, in_i, out_i):
+        group = groups[gi]
+        _, rep_p, rep_n, pp = group[0]
+        labels.append((pp.label, len(group)))
+        rule_vals = {'track_width': pp.width, 'diff_pair_gap': pp.gap,
+                     'via_size': pp.via_size, 'via_drill': pp.via_drill,
+                     'clearance': pp.clearance}
+        if pp.skew_max is not None:
+            rule_vals['diff_pair_intra_match'] = True
+            rule_vals['length_match_tolerance'] = pp.skew_max
+        if impedance is not None:
+            print(f"override: impedance={_fmt(impedance)} keeps its computed width "
+                  f"(rules say {_fmt(pp.width)})")
+        kw = _group_kwargs(diff_kwargs, rule_vals, explicit_flags, n_layers)
+        kw['obstacle_clearance_fn'] = _hook_for(rules, rep_p, in_i, explicit_flags,
+                                                partners=(rep_n,))
+        extra = ''
+        if kw.get('diff_pair_intra_match'):
+            extra = (f", diff_pair_intra_match=True, "
+                     f"length_match_tolerance={_fmt(kw['length_match_tolerance'])}")
+        print(f"\n=== KiCad rules group {gi + 1}/{len(groups)}: class {pp.label}, "
+              f"{len(group)} pairs, track {_fmt(kw['track_width'])}, "
+              f"gap {_fmt(kw['diff_pair_gap'])}, "
+              f"via {_fmt(kw['via_size'])}/{_fmt(kw['via_drill'])}, "
+              f"clearance {_fmt(kw['clearance'])}{extra} ===")
+        nets = [n for _, p, nn, _ in group for n in (p, nn)]
+        res = batch_route_fn(in_i, out_i, nets, **kw)
+        return res[0], res[1]
+
+    if not groups:
+        print("  no complete diff pairs among the given nets; nothing to route")
+        return 0, 0
+    results = _run_chain(input_file, output_file, len(groups), route_group)
+    totals = _print_summary(labels, results, "pairs")
+    _print_length_table(rules, output_file, pairs)
+    return totals
