@@ -151,6 +151,7 @@ class DruConstraint:
     min: Optional[float] = None
     opt: Optional[float] = None
     max: Optional[float] = None
+    within_diff_pairs: bool = False  # skew: limit applies inside each P/N pair
 
     def value(self) -> Optional[float]:
         """Value the router uses: opt, else min."""
@@ -373,7 +374,9 @@ def _parse_rule(form: list) -> DruRule:
                     raise _DruError("malformed constraint")
                 con = DruConstraint(kind=item[1])
                 for sub in item[2:]:
-                    if (isinstance(sub, list) and len(sub) == 2
+                    if sub == 'within_diff_pairs' or sub == ['within_diff_pairs']:
+                        con.within_diff_pairs = True
+                    elif (isinstance(sub, list) and len(sub) == 2
                             and sub[0] in ('min', 'opt', 'max')
                             and isinstance(sub[1], str)):
                         setattr(con, sub[0], _parse_length(sub[1]))
@@ -534,7 +537,11 @@ class BoardRules:
                     self._clr_rules.append(rule)
             if used:
                 self._applied.append(rule.name)
-        if 'Default' not in project.classes:
+        if not project.classes:
+            self._warn_once('noclasses', "project has no net classes (empty "
+                            "net_settings); routing falls back to command-line "
+                            "defaults for every net")
+        elif 'Default' not in project.classes:
             self._warn_once('default', "no 'Default' net class in project; "
                             "using command-line defaults for unset values")
 
@@ -581,6 +588,7 @@ class BoardRules:
 
         found: Dict[str, Optional[float]] = {}
         found_con: Dict[str, DruConstraint] = {}
+        skew_max: Optional[float] = None
         for rule in self.dru_rules:
             if not rule.supported or rule.uses_b:
                 continue
@@ -593,6 +601,11 @@ class BoardRules:
             for kind, con in rule.constraints.items():
                 if kind in ROUTING_KINDS and con.value() is not None:
                     found[kind] = con.value()
+                elif kind == 'skew':
+                    # Every matching skew rule bounds the pair (KiCad checks
+                    # each): keep the tightest, a later looser one never wins.
+                    if con.max is not None and (skew_max is None or con.max < skew_max):
+                        skew_max = con.max
                 elif kind in MATCH_KINDS:
                     found_con[kind] = con
 
@@ -604,21 +617,60 @@ class BoardRules:
 
         track = pick('track_width', 'track_width', 'track_width')
         dpw = self._class_value(cname, 'diff_pair_width')
-        skew = found_con.get('skew')
+        if dpw is None:
+            dpw = track
+        elif 'track_width' in found and dpw > 0:
+            # KiCad's DRC checks track_width rules on pair tracks too.
+            dpw = max(dpw, found['track_width'])
+        via_size = pick('via_diameter', 'via_diameter', 'via_size')
+        via_drill = pick('hole_size', 'via_drill', 'via_drill')
+        track = self._board_floor(cname, 'track width', track, 'min_track_width')
+        if dpw > 0:
+            dpw = self._board_floor(cname, 'diff pair width', dpw, 'min_track_width')
+        via_size = self._board_floor(cname, 'via diameter', via_size, 'min_via_diameter')
+        via_drill = self._board_floor(cname, 'via drill', via_drill,
+                                      'min_through_hole_diameter')
         length = found_con.get('length')
         p = NetParams(
             net_class=cname,
             track_width=track,
-            via_size=pick('via_diameter', 'via_diameter', 'via_size'),
-            via_drill=pick('hole_size', 'via_drill', 'via_drill'),
-            diff_pair_width=dpw if dpw is not None else track,
+            via_size=via_size,
+            via_drill=via_drill,
+            diff_pair_width=dpw,
             diff_pair_gap=pick('diff_pair_gap', 'diff_pair_gap', 'diff_pair_gap'),
-            skew_max=skew.max if skew is not None else None,
+            skew_max=skew_max,
             length_min=length.min if length is not None else None,
             length_max=length.max if length is not None else None,
         )
         self._params_memo[net_name] = p
         return p
+
+    def _board_floor(self, cname: str, what: str, value: float, key: str) -> float:
+        """value raised to Board Setup minimum `key` (recorded once per class/value)."""
+        floor = self.project.board_min.get(key)
+        if floor is None or value >= floor - 1e-9:
+            return value
+        self._warn_once(f'floor:{cname}:{what}:{value}',
+                        f"class {cname}: {what} {value:g} floored to board minimum "
+                        f"{key} {floor:g}")
+        return floor
+
+    # -- matching rules ---------------------------------------------------
+
+    def group_skew_rules(self) -> List[DruRule]:
+        """Applied skew rules without within_diff_pairs: they bound the skew
+        across every net they match, not only inside each pair."""
+        out = []
+        for rule in self.dru_rules:
+            con = rule.constraints.get('skew')
+            if (con is not None and rule.supported and not rule.uses_b
+                    and rule.layer is None and con.max is not None
+                    and not con.within_diff_pairs):
+                out.append(rule)
+        return out
+
+    def rule_matches(self, rule: DruRule, net_name: str) -> bool:
+        return eval_condition(rule, self._item(net_name), None)
 
     # -- clearance --------------------------------------------------------
 
@@ -686,6 +738,13 @@ class BoardRules:
 
     def print_report(self, net_names: List[str]) -> None:
         print("KiCad rules:")
+        if not self.project.classes:
+            print("  " + "!" * 70)
+            print("  WARNING: the project has no net classes (empty net_settings);")
+            print("  every net is routed with the command-line defaults. If an")
+            print("  earlier step rewrote the project, rerun it with")
+            print("  --no-fix-drc-settings or regenerate the project files.")
+            print("  " + "!" * 70)
         by_class: Dict[str, List[str]] = {}
         for n in net_names:
             by_class.setdefault(self.project.net_class(n), []).append(n)

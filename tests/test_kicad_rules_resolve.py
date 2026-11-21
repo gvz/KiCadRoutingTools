@@ -65,7 +65,7 @@ def test_precedence_dru_over_class(rules):
     assert p.track_width == pytest.approx(0.1016)   # dru opt 4mil beats class 0.1
     assert p.skew_max == pytest.approx(0.1)
     assert p.diff_pair_gap == 0.15
-    assert p.diff_pair_width == 0.1
+    assert p.diff_pair_width == pytest.approx(0.1016)  # track_width rule binds pairs too
     assert any("outer" in s for s in rules.report_items)   # layer rule skipped
 
 
@@ -196,3 +196,63 @@ def test_missing_cli_keys_filled(tmp_path):
     p = r.net_params("x")
     assert p.track_width > 0 and r.clearance("a", "b") > 0
     assert any("cli_defaults" in w for w in r.warnings)
+
+
+# --- final-review fixes -----------------------------------------------------
+
+F1_CLASSES = [
+    {"name": "Default", "clearance": 0.15, "track_width": 0.2,
+     "via_diameter": 0.6, "via_drill": 0.25},
+    {"name": "SGMII", "clearance": 0.15, "track_width": 0.1,
+     "diff_pair_gap": 0.15, "diff_pair_width": 0.1},
+]
+F1_PATTERNS = [{"pattern": "/SGMII_*", "netclass": "SGMII"}]
+
+
+def test_track_width_rule_raises_diff_pair_width(tmp_path):
+    r = make_rules(tmp_path, F1_CLASSES, F1_PATTERNS,
+                   rules={"min_track_width": 0.127},
+                   dru='(version 1)(rule "tw" (condition "A.NetClass == \'SGMII\'") '
+                       '(constraint track_width (min 0.15mm)))')
+    p = r.net_params("/SGMII_TX_P")
+    assert p.track_width == pytest.approx(0.15)
+    assert p.diff_pair_width == pytest.approx(0.15)
+
+
+def test_board_minima_floor_net_params(tmp_path, capsys):
+    r = make_rules(tmp_path, F1_CLASSES, F1_PATTERNS,
+                   rules={"min_track_width": 0.127, "min_via_diameter": 0.7,
+                          "min_through_hole_diameter": 0.3})
+    p = r.net_params("/SGMII_TX_P")
+    assert p.track_width == pytest.approx(0.127)
+    assert p.diff_pair_width == pytest.approx(0.127)
+    assert p.via_size == pytest.approx(0.7)
+    assert p.via_drill == pytest.approx(0.3)
+    q = r.net_params("uart0_tx")
+    assert q.track_width == pytest.approx(0.2)        # above the floor: unchanged
+    assert sum("floored to board minimum" in w for w in r.warnings) >= 3
+    r.print_report(["/SGMII_TX_P"])
+    assert "floored to board minimum" in capsys.readouterr().out
+
+
+def test_skew_within_diff_pairs_parsed_and_tightest_wins(tmp_path):
+    from kicad_rules import parse_dru
+    dru = ('(version 1)'
+           '(rule "sk" (condition "A.NetClass == \'SGMII\'") '
+           '(constraint skew (max 0.1mm) (within_diff_pairs)))'
+           '(rule "sk2" (condition "A.NetClass == \'SGMII\'") '
+           '(constraint skew (max 0.5mm)))')
+    rs = parse_dru(dru)
+    assert rs[0].constraints["skew"].within_diff_pairs is True
+    assert rs[1].constraints["skew"].within_diff_pairs is False
+    r = make_rules(tmp_path, F1_CLASSES, F1_PATTERNS, dru=dru)
+    assert r.net_params("/SGMII_TX_P").skew_max == pytest.approx(0.1)
+    assert [x.name for x in r.group_skew_rules()] == ["sk2"]
+
+
+def test_no_net_classes_prominent_warning(tmp_path, capsys):
+    r = make_rules(tmp_path, classes=None)
+    assert any("no net classes" in w for w in r.warnings)
+    r.print_report(["x"])
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "no net classes" in out
