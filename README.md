@@ -793,8 +793,8 @@ Every tool prints its full option list with `--help`, and **[docs/configuration.
 
 | Tool | Purpose | Guide |
 |------|---------|-------|
-| `route.py` | Single-ended routing | [Configuration](docs/configuration.md) |
-| `route_diff.py` | Differential-pair routing | [Differential Pairs](docs/differential-pairs.md) |
+| `route.py` | Single-ended routing; `--kicad-rules` routes from the board's `.kicad_pro`/`.kicad_dru` | [Configuration](docs/configuration.md#routing-from-kicad-rule-files) |
+| `route_diff.py` | Differential-pair routing; `--kicad-rules` takes pair width/gap/skew from the KiCad rules | [Differential Pairs](docs/differential-pairs.md), [KiCad rules](docs/configuration.md#routing-from-kicad-rule-files) |
 | `route_planes.py` | Power/ground plane via connections | [Plane Routing](docs/route-plane.md) |
 | `route_disconnected_planes.py` | Plane region repair + pad taps | [Plane Routing](docs/route-plane.md) |
 | `bga_fanout.py` / `qfn_fanout.py` | BGA / QFN escape fanout | [BGA](bga_fanout/README.md) · [QFN](qfn_fanout/README.md) · [Utilities](docs/utilities.md) |
