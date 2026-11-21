@@ -4,6 +4,7 @@ Currently: net classes, pattern/explicit net assignments and Board Setup
 minima from a .kicad_pro. All lengths are in mm.
 """
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -443,3 +444,237 @@ def eval_condition(rule: DruRule, a: ItemInfo, b: Optional[ItemInfo]) -> bool:
         return _eval_node(rule._ast, {'A': a, 'B': b if b is not None else ItemInfo("", "")})
     except RecursionError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Resolution: per-net parameters, pairwise clearance, routing groups
+# ---------------------------------------------------------------------------
+
+_CLI_KEYS = ('clearance', 'track_width', 'via_size', 'via_drill', 'diff_pair_gap')
+
+
+@dataclass
+class NetParams:
+    net_class: str
+    track_width: float
+    via_size: float
+    via_drill: float
+    diff_pair_width: float
+    diff_pair_gap: float
+    skew_max: Optional[float] = None
+    length_min: Optional[float] = None
+    length_max: Optional[float] = None
+
+
+def _netname_patterns(node, out):
+    """Collect (side, pattern) of every A/B.NetName comparison in an AST."""
+    if node is None:
+        return out
+    if node[0] in ('or', 'and'):
+        _netname_patterns(node[1], out)
+        _netname_patterns(node[2], out)
+    elif node[0] == 'not':
+        _netname_patterns(node[1], out)
+    elif node[2] == 'NetName':
+        out.append((node[1], node[3]))
+    return out
+
+
+class BoardRules:
+    """Routing constraints resolved from a board's .kicad_pro and .kicad_dru."""
+
+    def __init__(self, project: ProjectRules, dru_rules: List[DruRule],
+                 cli_defaults: Dict[str, float]):
+        self.project = project
+        self.dru_rules = dru_rules
+        self.cli = dict(cli_defaults)
+        self._warn: List[str] = []
+        self._warned = set()
+        self.report_items: List[str] = []
+        self.unsupported: List[Tuple[str, str]] = []
+        self.drc_only: List[str] = []
+        self._params_memo: Dict[str, NetParams] = {}
+        self._sig_memo: Dict[str, Tuple] = {}
+        self._clr_rules = []
+        for rule in dru_rules:
+            if not rule.supported:
+                self.unsupported.append((rule.name, rule.reason))
+                continue
+            if any(k not in ROUTING_KINDS and k not in MATCH_KINDS
+                   for k in rule.constraints):
+                self.drc_only.append(rule.name)
+            if rule.layer is None and rule.constraints.get('clearance') is not None \
+                    and rule.constraints['clearance'].value() is not None:
+                self._clr_rules.append(rule)
+        if 'Default' not in project.classes:
+            self._warn_once('default', "no 'Default' net class in project; "
+                            "using command-line defaults for unset values")
+
+    @property
+    def warnings(self) -> List[str]:
+        return self.project.warnings + self._warn
+
+    def _warn_once(self, key, msg):
+        if key not in self._warned:
+            self._warned.add(key)
+            self._warn.append(msg)
+
+    @classmethod
+    def load(cls, pcb_path: str, cli_defaults: Dict[str, float]) -> 'BoardRules':
+        base = pcb_path.rsplit('.', 1)[0] if '.' in os.path.basename(pcb_path) else pcb_path
+        return cls(load_project_rules(base + '.kicad_pro'),
+                   load_dru(base + '.kicad_dru'), cli_defaults)
+
+    # -- helpers ----------------------------------------------------------
+
+    def _class_value(self, cls_name: str, attr: str) -> Optional[float]:
+        classes = self.project.classes
+        c = classes.get(cls_name)
+        if c is None and cls_name != 'Default':
+            self._warn_once('cls:' + cls_name,
+                            f"net class '{cls_name}' is not defined in the project; "
+                            "using Default values")
+        v = getattr(c, attr, None) if c is not None else None
+        if v is None:
+            d = classes.get('Default')
+            v = getattr(d, attr, None) if d is not None else None
+        return v
+
+    def _item(self, net: str) -> ItemInfo:
+        return ItemInfo(net, self.project.net_class(net))
+
+    # -- per-net parameters ----------------------------------------------
+
+    def net_params(self, net_name: str) -> NetParams:
+        if net_name in self._params_memo:
+            return self._params_memo[net_name]
+        item = self._item(net_name)
+        cname = item.net_class
+
+        found: Dict[str, Optional[float]] = {}
+        found_con: Dict[str, DruConstraint] = {}
+        for rule in self.dru_rules:
+            if not rule.supported or rule.uses_b:
+                continue
+            if not any(k in ROUTING_KINDS or k in MATCH_KINDS for k in rule.constraints):
+                continue
+            if not eval_condition(rule, item, None):
+                continue
+            if rule.layer is not None:
+                msg = (f"rule '{rule.name}' is restricted to layer '{rule.layer}'; "
+                       "not applied to routing values")
+                if msg not in self.report_items:
+                    self.report_items.append(msg)
+                continue
+            for kind, con in rule.constraints.items():
+                if kind in ROUTING_KINDS and con.value() is not None:
+                    found[kind] = con.value()
+                elif kind in MATCH_KINDS:
+                    found_con[kind] = con
+
+        def pick(kind, attr, cli_key):
+            if kind in found:
+                return found[kind]
+            v = self._class_value(cname, attr)
+            return v if v is not None else self.cli[cli_key]
+
+        track = pick('track_width', 'track_width', 'track_width')
+        dpw = self._class_value(cname, 'diff_pair_width')
+        skew = found_con.get('skew')
+        length = found_con.get('length')
+        p = NetParams(
+            net_class=cname,
+            track_width=track,
+            via_size=pick('via_diameter', 'via_diameter', 'via_size'),
+            via_drill=pick('hole_size', 'via_drill', 'via_drill'),
+            diff_pair_width=dpw if dpw is not None else track,
+            diff_pair_gap=pick('diff_pair_gap', 'diff_pair_gap', 'diff_pair_gap'),
+            skew_max=skew.max if skew is not None else None,
+            length_min=length.min if length is not None else None,
+            length_max=length.max if length is not None else None,
+        )
+        self._params_memo[net_name] = p
+        return p
+
+    # -- clearance --------------------------------------------------------
+
+    def _class_clearance(self, cname: str) -> float:
+        v = self._class_value(cname, 'clearance')
+        return v if v is not None else self.cli['clearance']
+
+    def clearance(self, net_a: str, net_b: str) -> float:
+        a, b = self._item(net_a), self._item(net_b)
+        result = max(self._class_clearance(a.net_class),
+                     self._class_clearance(b.net_class))
+        for rule in self._clr_rules:
+            if rule.uses_b:
+                hit = eval_condition(rule, a, b) or eval_condition(rule, b, a)
+            else:
+                hit = eval_condition(rule, a, None) or eval_condition(rule, b, None)
+            if hit:
+                result = rule.constraints['clearance'].value()
+        return max(result, self.project.board_min.get('min_clearance', 0.0))
+
+    # -- grouping ---------------------------------------------------------
+
+    def signature(self, net_name: str) -> Tuple:
+        """Nets with equal signatures resolve identically against any other net.
+
+        Entries are (rule index, matched (side, pattern) pairs) for each supported
+        rule whose condition names this net via A.NetName/B.NetName.
+        """
+        if net_name in self._sig_memo:
+            return self._sig_memo[net_name]
+        entries = []
+        for i, rule in enumerate(self.dru_rules):
+            if not rule.supported or not rule.uses_netname:
+                continue
+            hits = tuple(sorted(
+                (side, pat) for side, pat in _netname_patterns(rule._ast, [])
+                if kicad_wildcard_match(net_name, pat)))
+            if hits:
+                entries.append((i, hits))
+        sig = (self.project.net_class(net_name), tuple(entries))
+        self._sig_memo[net_name] = sig
+        return sig
+
+    def group_nets(self, net_names: List[str]) -> List[List[str]]:
+        groups: Dict[Tuple, List[str]] = {}
+        for n in net_names:
+            groups.setdefault(self.signature(n), []).append(n)
+        order = self.project.class_order
+
+        def rank(sig):
+            c = sig[0]
+            if c == 'Default':
+                return len(order) + 1
+            return order.index(c) if c in order else len(order)
+
+        # sorted() is stable: ties keep first-appearance order
+        return [g for _, g in sorted(groups.items(), key=lambda kv: rank(kv[0]))]
+
+    # -- report -----------------------------------------------------------
+
+    def print_report(self, net_names: List[str]) -> None:
+        print("KiCad rules:")
+        by_class: Dict[str, List[str]] = {}
+        for n in net_names:
+            by_class.setdefault(self.project.net_class(n), []).append(n)
+        for cname, nets in by_class.items():
+            p = self.net_params(nets[0])
+            print(f"  class {cname}: {len(nets)} nets, track {p.track_width:g}, "
+                  f"via {p.via_size:g}/{p.via_drill:g}, "
+                  f"diff pair {p.diff_pair_width:g}/{p.diff_pair_gap:g}, "
+                  f"clearance {self._class_clearance(cname):g}")
+        applied = [r.name for r in self.dru_rules if r.supported and any(
+            k in ROUTING_KINDS or k in MATCH_KINDS for k in r.constraints)]
+        if applied:
+            print("  applied rules: " + ", ".join(applied))
+        for item in self.report_items:
+            print(f"  note: {item}")
+        for name, reason in self.unsupported:
+            print(f"  unsupported rule '{name}': {reason}")
+        if self.drc_only:
+            print("  DRC-only rules (not used for routing): " + ", ".join(self.drc_only))
+        for w in self.warnings:
+            print(f"  warning: {w}")
