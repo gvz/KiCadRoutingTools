@@ -41,7 +41,7 @@ class ProjectRules:
     assignments: Dict[str, str] = field(default_factory=dict)
     board_min: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    _memo: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _memo: Dict[str, str] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def net_class(self, net_name: str) -> str:
         """Explicit assignment, else first matching pattern, else "Default"."""
@@ -95,6 +95,9 @@ def load_project_rules(pro_path: str) -> ProjectRules:
             rules.warnings.append(f"skipped malformed netclass entry {c!r}")
             continue
         name = c.get('name', 'Default')
+        if not isinstance(name, str):
+            rules.warnings.append(f"skipped netclass with invalid name {name!r}")
+            continue
         vals = {k: c[k] for k in _CLASS_FIELDS if num(c.get(k))}
         rules.classes[name] = NetClass(name=name, **vals)
         if name not in rules.class_order:
@@ -102,7 +105,7 @@ def load_project_rules(pro_path: str) -> ProjectRules:
 
     for p in section(ns, 'netclass_patterns', list):
         if (isinstance(p, dict) and isinstance(p.get('pattern'), str)
-                and p.get('netclass')):
+                and isinstance(p.get('netclass'), str) and p['netclass']):
             rules.patterns.append((p['pattern'], p['netclass']))
         else:
             rules.warnings.append(f"skipped malformed netclass pattern entry {p!r}")

@@ -78,3 +78,17 @@ def test_malformed_entries_warn(tmp_path):
     p.write_text(json.dumps({"net_settings": 5, "board": []}))
     r = load_project_rules(str(p))
     assert r.warnings
+
+
+def test_bad_class_names_warn(tmp_path):
+    import json
+    p = tmp_path / "x.kicad_pro"
+    p.write_text(json.dumps({"net_settings": {
+        "classes": [{"name": ["x"]}, {"name": {}}, {"name": None},
+                    {"name": "Good", "track_width": 0.2}],
+        "netclass_patterns": [{"pattern": "A*", "netclass": ["y"]},
+                              {"pattern": 5, "netclass": "Good"}]}}))
+    r = load_project_rules(str(p))
+    assert list(r.classes) == ["Good"]
+    assert r.patterns == []
+    assert len(r.warnings) == 5
