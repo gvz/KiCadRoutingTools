@@ -4,7 +4,7 @@ Configuration classes and coordinate utilities for PCB routing.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple, Dict
+from typing import Callable, List, Optional, Tuple, Dict
 from dataclasses import dataclass, field
 
 from routing_constants import FORBIDDEN_LAYER_COST
@@ -151,6 +151,16 @@ class GridRouteConfig:
     # Keepout zone - keep routed tracks out of a user-drawn polygon (issue #27)
     keepout_enabled: bool = False  # Block routed tracks from a drawn keepout polygon
     keepout_layer: str = "User.2"  # User layer the keepout polygon is drawn on
+    # Per-net obstacle clearance hook: net_id -> clearance (mm) used when stamping
+    # that obstacle net's copper (segments, vias, pads). None = config.clearance
+    # for every net (default behaviour). Set per routing group from KiCad rules.
+    obstacle_clearance_fn: Optional[Callable[[int], float]] = None
+
+    def clearance_for_net(self, net_id: int) -> float:
+        """Clearance (mm) to stamp around obstacle net `net_id`'s copper."""
+        if self.obstacle_clearance_fn is not None:
+            return self.obstacle_clearance_fn(net_id)
+        return self.clearance
 
     def get_track_width(self, layer: str) -> float:
         """Get track width for a specific layer (impedance-aware).

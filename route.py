@@ -318,7 +318,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 return_results: bool = False,
                 pcb_data=None,
                 net_clearances: dict = None,
-                rip_existing_nets: Optional[List[str]] = None) -> Tuple[int, int, float]:
+                rip_existing_nets: Optional[List[str]] = None,
+                obstacle_clearance_fn=None) -> Tuple[int, int, float]:
     """
     Route single-ended nets using the Rust router.
 
@@ -339,6 +340,9 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
             - "original": Keep nets in original order
         track_width: Track width in mm (default: 0.1)
         clearance: Clearance between tracks in mm (default: 0.1)
+        obstacle_clearance_fn: Optional net_id -> clearance (mm) used when stamping
+            each obstacle net's copper (KiCad rules). Overrides net_clearances.
+            None = clearance for every net.
         via_size: Via outer diameter in mm (default: 0.3)
         via_drill: Via drill size in mm (default: 0.2)
         grid_step: Grid resolution in mm (default: 0.1)
@@ -513,6 +517,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         config_kwargs['impedance_target'] = impedance
     if collect_stats:
         config_kwargs['collect_stats'] = collect_stats
+    # Per-net obstacle clearance hook (net_id -> mm); None keeps config.clearance.
+    config_kwargs['obstacle_clearance_fn'] = obstacle_clearance_fn
     config = GridRouteConfig(**config_kwargs)
 
     # Build guide-corridor waypoints once (issue #7). These steer the per-segment

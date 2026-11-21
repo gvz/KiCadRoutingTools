@@ -174,7 +174,8 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
                 return_results: bool = False,
                 pcb_data=None,
                 cancel_check=None,
-                progress_callback=None) -> Tuple[int, int, float]:
+                progress_callback=None,
+                obstacle_clearance_fn=None) -> Tuple[int, int, float]:
     """
     Route differential pairs using the Rust router.
 
@@ -305,6 +306,8 @@ def batch_route_diff_pairs(input_file: str, output_file: str, net_names: List[st
         config_kwargs['layer_widths'] = layer_widths
         config_kwargs['impedance_target'] = impedance
     config_kwargs['layer_costs'] = layer_costs  # per-layer bias for coupled diff routing (#193)
+    # Per-net obstacle clearance hook (net_id -> mm); None keeps config.clearance.
+    config_kwargs['obstacle_clearance_fn'] = obstacle_clearance_fn
     config = GridRouteConfig(**config_kwargs)
 
     # Find differential pairs from all provided nets
