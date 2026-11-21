@@ -2101,8 +2101,10 @@ For differential pair routing, use route_diff.py:
     )
     if args.kicad_rules:
         from kicad_rules_runner import run_route_with_rules
-        explicit_flags = {dest for dest in ('track_width', 'clearance', 'via_size', 'via_drill')
-                          if getattr(args, dest) != parser.get_default(dest)}
+        from kicad_rules_runner import explicit_flags_from_argv
+        explicit_flags = explicit_flags_from_argv(
+            parser, ('track_width', 'clearance', 'via_size', 'via_drill',
+                     'board_edge_clearance', 'hole_to_hole_clearance'))
         run_route_with_rules(args.input_file, args.output_file, net_names,
                              route_kwargs, explicit_flags, batch_route_fn=batch_route)
     else:

@@ -41,6 +41,10 @@ DRU_TEXT = """(version 1)
 (rule "wide_to_default"
   (condition "A.NetClass == 'WIDE' && B.NetClass == 'Default'")
   (constraint clearance (min 0.3mm)))
+(rule "wide_match"
+  (condition "A.NetClass == 'WIDE'")
+  (constraint length (max 1mm))
+  (constraint skew (max 0.01mm)))
 """
 
 
@@ -241,6 +245,63 @@ def test_explicit_flag_overrides(tmp_path):
 def test_default_path_untouched(tmp_path):
     # without --kicad-rules route.py output counts equal a baseline run
     assert route_counts(tmp_path, flags=[]) == BASELINE_COUNTS
+
+
+def test_length_and_group_skew_report(routed_run):
+    out = routed_run[0].stdout
+    assert "Length check" in out
+    for net in WIDE_NETS:   # a single-ended net under a 1mm length max
+        assert re.search(re.escape(net) + r"\s+[\d.]+\s+-\s+1\s+FAIL", out), net
+    assert re.search(r"rule 'wide_match': group skew across all matched nets "
+                     r"\(2 nets\): [\d.]+ vs 0\.01 (PASS|FAIL)", out)
+
+
+def test_explicit_flags_from_argv():
+    import argparse
+    from kicad_rules_runner import explicit_flags_from_argv
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--track-width", type=float, default=0.3)
+    ap.add_argument("--clearance", type=float, default=0.25)
+    ap.add_argument("--via-size", type=float, default=0.5)
+    ap.add_argument("--nets", nargs="+")
+    dests = ("track_width", "clearance", "via_size")
+    # typed value equal to the default still counts as explicit
+    assert explicit_flags_from_argv(ap, dests, ["in", "out", "--track-width", "0.3"]) \
+        == {"track_width"}
+    assert explicit_flags_from_argv(ap, dests, ["--clearance=0.25"]) == {"clearance"}
+    assert explicit_flags_from_argv(ap, dests, ["--via", "0.5"]) == {"via_size"}  # abbrev
+    assert explicit_flags_from_argv(ap, dests, ["in", "out", "--nets", "a"]) == set()
+
+
+def test_clearance_hook_fab_floored(tmp_path):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kicad_rules import BoardRules
+    from kicad_rules_fixtures import write_pro
+    from kicad_rules_runner import make_clearance_fn
+    pro = write_pro(tmp_path, classes=[{"name": "Default", "clearance": 0.03}])
+    r = BoardRules.load(pro[:-len(".kicad_pro")] + ".kicad_pcb",
+                        {"clearance": 0.2, "track_width": 0.2, "via_size": 0.6,
+                         "via_drill": 0.3, "diff_pair_gap": 0.1})
+    assert make_clearance_fn(r, "a", {1: "b"})(1) == pytest.approx(0.03)
+    assert make_clearance_fn(r, "a", {1: "b"}, floor=0.0889)(1) == pytest.approx(0.0889)
+
+
+def test_board_setup_kwargs(tmp_path, capsys):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kicad_rules import BoardRules
+    from kicad_rules_fixtures import write_pro
+    from kicad_rules_runner import board_rule_vals, _group_kwargs
+    pro = write_pro(tmp_path, classes=[{"name": "Default"}],
+                    rules={"min_copper_edge_clearance": 0.5, "min_hole_to_hole": 0.25})
+    r = BoardRules.load(pro[:-len(".kicad_pro")] + ".kicad_pcb", {})
+    vals = board_rule_vals(r)
+    assert vals == {"board_edge_clearance": 0.5, "hole_to_hole_clearance": 0.25}
+    base = {"board_edge_clearance": 0.0, "hole_to_hole_clearance": 0.2}
+    kw = _group_kwargs(base, vals, set(), 4)
+    assert kw["board_edge_clearance"] == 0.5 and kw["hole_to_hole_clearance"] == 0.25
+    kw = _group_kwargs(base, vals, {"board_edge_clearance"}, 4)
+    assert kw["board_edge_clearance"] == 0.0
+    assert "override: board_edge_clearance=0 (rules say 0.5)" in capsys.readouterr().out
 
 
 if __name__ == "__main__":

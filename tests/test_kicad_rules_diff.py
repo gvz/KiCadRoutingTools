@@ -272,5 +272,26 @@ def test_default_path_untouched(tmp_path):
     assert _counts(proc) == BASELINE_COUNTS
 
 
+def test_gap_below_pair_clearance_warns(tmp_path, capsys):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kicad_rules import BoardRules
+    from kicad_rules_fixtures import write_pro
+    from kicad_rules_runner import warn_gap_below_clearance
+    pro = write_pro(tmp_path, classes=[{"name": "Default", "clearance": 0.15,
+                                        "diff_pair_gap": 0.12}])
+    r = BoardRules.load(pro[:-len(".kicad_pro")] + ".kicad_pcb", {})
+    assert warn_gap_below_clearance(r, "D", "D_P", "D_N", 0.12) is True
+    out = capsys.readouterr().out
+    assert "0.12" in out and "0.15" in out and "D_P" in out and "D_N" in out
+    assert "raise the gap" in out and "clearance rule" in out
+    assert warn_gap_below_clearance(r, "D", "D_P", "D_N", 0.15) is False
+    assert capsys.readouterr().out == ""
+
+
+def test_intra_pair_skew_labelled(run):
+    assert re.search(r"pair /fpga_adc/lvds_rx1_12: intra-pair skew [\d.]+ "
+                     r"\(max 0\.05\) (PASS|FAIL)", run.stdout)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

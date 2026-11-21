@@ -1476,9 +1476,11 @@ Examples:
     )
     if args.kicad_rules:
         from kicad_rules_runner import run_diff_with_rules
-        explicit_flags = {dest for dest in ('track_width', 'clearance', 'via_size', 'via_drill',
-                                            'diff_pair_gap', 'length_match_tolerance')
-                          if getattr(args, dest) != parser.get_default(dest)}
+        from kicad_rules_runner import explicit_flags_from_argv
+        explicit_flags = explicit_flags_from_argv(
+            parser, ('track_width', 'clearance', 'via_size', 'via_drill',
+                     'diff_pair_gap', 'length_match_tolerance',
+                     'board_edge_clearance', 'hole_to_hole_clearance'))
         run_diff_with_rules(args.input_file, args.output_file, net_names,
                             diff_kwargs, explicit_flags,
                             batch_route_fn=batch_route_diff_pairs)

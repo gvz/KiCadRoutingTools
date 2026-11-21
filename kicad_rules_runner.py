@@ -34,15 +34,53 @@ def _net_names_by_id(pcb_file: str) -> Dict[int, str]:
     return {nid: (net.name or "") for nid, net in pcb.nets.items()}
 
 
+def explicit_flags_from_argv(parser, dests: Sequence[str],
+                             argv: Optional[Sequence[str]] = None) -> Set[str]:
+    """Dests in `dests` whose option the user typed on the command line.
+
+    Reads argv (default sys.argv[1:]) rather than comparing parsed values to
+    defaults, so typing a flag's default value still counts as explicit. A token
+    counts when it equals one of the action's option strings, starts with
+    `<option>=`, or (with parser.allow_abbrev) is a `--` prefix of exactly one
+    long option, which is that action's. Scanning stops at a bare `--`.
+    """
+    import sys
+    if argv is None:
+        argv = sys.argv[1:]
+    actions = {a.dest: a for a in parser._actions if a.option_strings}
+    long_opts = [o for a in parser._actions for o in a.option_strings
+                 if o.startswith('--')]
+    found = set()
+    for tok in argv:
+        if tok == '--':
+            break
+        if not tok.startswith('-'):
+            continue
+        head = tok.split('=', 1)[0]
+        for dest in dests:
+            act = actions.get(dest)
+            if act is None:
+                continue
+            if head in act.option_strings:
+                found.add(dest)
+            elif (getattr(parser, 'allow_abbrev', True) and head.startswith('--')
+                  and head not in long_opts):
+                hits = [o for o in long_opts if o.startswith(head)]
+                if len(hits) == 1 and hits[0] in act.option_strings:
+                    found.add(dest)
+    return found
+
+
 def make_clearance_fn(rules: BoardRules, rep: str, names_by_id: Dict[int, str],
-                      partners: Sequence[str] = ()):
+                      partners: Sequence[str] = (), floor: float = 0.0):
     """Obstacle hook: clearance between group representative `rep` and net `nid`.
 
     With `partners` (a diff pair's N net), the hook returns the larger of the
     clearances of `rep` and each partner to `nid`, so a pair whose halves sit in
     different classes keeps the stricter one. Net 0 and ids not in the board
     resolve as name "" (the Default class). Memoised per net id; the hook runs
-    once per stamped segment/via/pad.
+    once per stamped segment/via/pad. Each value is raised to `floor` (the fab
+    clearance floor _group_kwargs applies to the group clearance).
     """
     reps = (rep,) + tuple(x for x in partners if x != rep)
     memo: Dict[int, float] = {}
@@ -51,7 +89,7 @@ def make_clearance_fn(rules: BoardRules, rep: str, names_by_id: Dict[int, str],
         v = memo.get(nid)
         if v is None:
             name = names_by_id.get(nid, "") if nid else ""
-            v = memo[nid] = max(rules.clearance(r, name) for r in reps)
+            v = memo[nid] = max([floor] + [rules.clearance(r, name) for r in reps])
         return v
     return fn
 
@@ -120,11 +158,28 @@ def _group_kwargs(base_kwargs: dict, rule_vals: dict, explicit_flags: Set[str],
     return kw
 
 
+def _clearance_floor(n_layers: int) -> float:
+    from fab_tiers import fab_floor_for_param
+    return fab_floor_for_param('clearance', n_layers) or 0.0
+
+
+def board_rule_vals(rules: BoardRules) -> dict:
+    """batch kwargs taken from Board Setup minima: copper-to-edge and hole-to-hole."""
+    bm = rules.project.board_min
+    out = {}
+    for key, kw in (('min_copper_edge_clearance', 'board_edge_clearance'),
+                    ('min_hole_to_hole', 'hole_to_hole_clearance')):
+        if bm.get(key, 0) > 0:
+            out[kw] = bm[key]
+    return out
+
+
 def _hook_for(rules: BoardRules, rep: str, pcb_file: str, explicit_flags: Set[str],
-              partners: Sequence[str] = ()):
+              n_layers: int, partners: Sequence[str] = ()):
     if 'clearance' in explicit_flags:
         return None  # an explicit --clearance applies to every net pair
-    return make_clearance_fn(rules, rep, _net_names_by_id(pcb_file), partners)
+    return make_clearance_fn(rules, rep, _net_names_by_id(pcb_file), partners,
+                             floor=_clearance_floor(n_layers))
 
 
 def _run_chain(input_file: str, output_file: str, n_groups: int,
@@ -197,9 +252,10 @@ def run_route_with_rules(input_file: str, output_file: str, net_names: List[str]
         labels.append((p.net_class, len(group)))
         kw = _group_kwargs(route_kwargs,
                            {'track_width': p.track_width, 'via_size': p.via_size,
-                            'via_drill': p.via_drill, 'clearance': rules.clearance(rep, rep)},
+                            'via_drill': p.via_drill, 'clearance': rules.clearance(rep, rep),
+                            **board_rule_vals(rules)},
                            explicit_flags, n_layers)
-        kw['obstacle_clearance_fn'] = _hook_for(rules, rep, in_i, explicit_flags)
+        kw['obstacle_clearance_fn'] = _hook_for(rules, rep, in_i, explicit_flags, n_layers)
         kw['rip_existing_nets'] = None
         print(f"\n=== KiCad rules group {gi + 1}/{len(groups)}: class {p.net_class}, "
               f"{len(group)} nets, track {_fmt(kw['track_width'])}, "
@@ -209,7 +265,14 @@ def run_route_with_rules(input_file: str, output_file: str, net_names: List[str]
         return res[0], res[1]
 
     results = _run_chain(input_file, output_file, len(groups), route_group)
-    return _print_summary(labels, results, "nets")
+    totals = _print_summary(labels, results, "nets")
+    windows = []
+    for n in net_names:
+        p = rules.net_params(n)
+        if p.length_min is not None or p.length_max is not None:
+            windows.append((n, p.length_min, p.length_max))
+    _print_length_table(rules, output_file, windows, [], net_names)
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -269,10 +332,31 @@ def pair_params(rules: BoardRules, p_net: str, n_net: str, base: str = "") -> Pa
         length_max=_opt(min, (a.length_max, b.length_max)))
 
 
+def warn_gap_below_clearance(rules: BoardRules, base: str, p_net: str, n_net: str,
+                             gap: float) -> bool:
+    """Warn (and return True) when the pair gap is below the P<->N clearance the
+    rules require: KiCad's DRC then flags the coupled run as a clearance error."""
+    clr = rules.clearance(p_net, n_net)
+    if gap < clr - 1e-9:
+        print(f"  warning: pair {base}: diff pair gap {gap:g} is below the "
+              f"{p_net}<->{n_net} clearance {clr:g}; DRC will flag the coupled run. "
+              f"Fix: raise the gap to at least {clr:g}, or add a clearance rule "
+              f"for the pair (e.g. A.NetName/B.NetName on {p_net} and {n_net}).")
+        return True
+    return False
+
+
 def _print_length_table(rules: BoardRules, output_file: str,
-                        pairs: List[Tuple[str, str, str, PairParams]]) -> None:
-    """Per-net routed length vs the pair's length window, then per-pair skew,
-    measured on the final board; then the DRC-only rule list."""
+                        windows: List[Tuple[str, Optional[float], Optional[float]]],
+                        pairs: List[Tuple[str, str, str, Optional[float]]],
+                        routed_nets: Sequence[str]) -> None:
+    """Measured on the final board: per-net routed length vs its length window,
+    intra-pair skew per pair, the group skew of every skew rule without
+    within_diff_pairs across the routed nets it matches; then the DRC-only list.
+
+    `windows` is (net, length_min, length_max); `pairs` is (base, P, N, skew_max).
+    Lengths count all copper on the net (stubs and via barrels included).
+    """
     from kicad_parser import parse_kicad_pcb
     from net_queries import calculate_route_length
     print(f"\nLength check (KiCad length/skew rules) on {output_file}:")
@@ -281,34 +365,45 @@ def _print_length_table(rules: BoardRules, output_file: str,
     else:
         pcb = parse_kicad_pcb(output_file)
         ids = {n.name: nid for nid, n in pcb.nets.items() if n.name}
+        cache: Dict[str, float] = {}
 
         def length(name):
-            nid = ids.get(name)
-            if nid is None:
-                return 0.0
-            return calculate_route_length([s for s in pcb.segments if s.net_id == nid],
-                                          [v for v in pcb.vias if v.net_id == nid], pcb)
+            if name not in cache:
+                nid = ids.get(name)
+                cache[name] = 0.0 if nid is None else calculate_route_length(
+                    [s for s in pcb.segments if s.net_id == nid],
+                    [v for v in pcb.vias if v.net_id == nid], pcb)
+            return cache[name]
 
         def lim(v):
             return '-' if v is None else _fmt(v)
 
-        w = max([len(n) for _, p, nn, _ in pairs for n in (p, nn)] + [3])
-        print(f"  {'net':<{w}} {'length':>9} {'min':>6} {'max':>6} result")
-        skews = []
-        for base, p_net, n_net, pp in pairs:
-            lens = []
-            for name in (p_net, n_net):
+        if windows:
+            w = max([len(n) for n, _, _ in windows] + [3])
+            print(f"  {'net':<{w}} {'length':>9} {'min':>6} {'max':>6} result")
+            for name, lmin, lmax in windows:
                 L = length(name)
-                lens.append(L)
-                ok = ((pp.length_min is None or L >= pp.length_min - 1e-6)
-                      and (pp.length_max is None or L <= pp.length_max + 1e-6))
-                print(f"  {name:<{w}} {L:9.3f} {lim(pp.length_min):>6} "
-                      f"{lim(pp.length_max):>6} {'PASS' if ok else 'FAIL'}")
-            skews.append((base, abs(lens[0] - lens[1]), pp.skew_max))
-        for base, d, smax in skews:
+                ok = ((lmin is None or L >= lmin - 1e-6)
+                      and (lmax is None or L <= lmax + 1e-6))
+                print(f"  {name:<{w}} {L:9.3f} {lim(lmin):>6} "
+                      f"{lim(lmax):>6} {'PASS' if ok else 'FAIL'}")
+        else:
+            print("  no length rules match the routed nets")
+        for base, p_net, n_net, smax in pairs:
             if smax is not None:
+                d = abs(length(p_net) - length(n_net))
                 res = 'PASS' if d <= smax + 1e-6 else 'FAIL'
-                print(f"  pair {base}: skew {d:.3f} (max {_fmt(smax)}) {res}")
+                print(f"  pair {base}: intra-pair skew {d:.3f} (max {_fmt(smax)}) {res}")
+        for rule in rules.group_skew_rules():
+            matched = [n for n in routed_nets if rules.rule_matches(rule, n)]
+            if not matched:
+                continue
+            lens = [length(n) for n in matched]
+            d = max(lens) - min(lens)
+            smax = rule.constraints['skew'].max
+            res = 'PASS' if d <= smax + 1e-6 else 'FAIL'
+            print(f"  rule '{rule.name}': group skew across all matched nets "
+                  f"({len(matched)} nets): {d:.3f} vs {_fmt(smax)} {res}")
     if rules.drc_only:
         print("  DRC-only rules (not used for routing): " + ", ".join(rules.drc_only))
     else:
@@ -342,6 +437,11 @@ def run_diff_with_rules(input_file: str, output_file: str, net_names: List[str],
             pairs.append((base, dp.p_net_name, dp.n_net_name,
                           pair_params(rules, dp.p_net_name, dp.n_net_name, base)))
     paired = {n for _, p, nn, _ in pairs for n in (p, nn)}
+    for base, p_net, n_net, pp in pairs:
+        gap = (diff_kwargs.get('diff_pair_gap') if 'diff_pair_gap' in explicit_flags
+               else pp.gap)
+        if gap is not None:
+            warn_gap_below_clearance(rules, base, p_net, n_net, gap)
     loose = [n for n in net_names if n not in paired]
     if loose:
         print(f"  note: {len(loose)} net(s) are not in a P/N pair and are not "
@@ -366,7 +466,7 @@ def run_diff_with_rules(input_file: str, output_file: str, net_names: List[str],
         labels.append((pp.label, len(group)))
         rule_vals = {'track_width': pp.width, 'diff_pair_gap': pp.gap,
                      'via_size': pp.via_size, 'via_drill': pp.via_drill,
-                     'clearance': pp.clearance}
+                     'clearance': pp.clearance, **board_rule_vals(rules)}
         if pp.skew_max is not None:
             rule_vals['diff_pair_intra_match'] = True
             rule_vals['length_match_tolerance'] = pp.skew_max
@@ -375,7 +475,7 @@ def run_diff_with_rules(input_file: str, output_file: str, net_names: List[str],
                   f"(rules say {_fmt(pp.width)})")
         kw = _group_kwargs(diff_kwargs, rule_vals, explicit_flags, n_layers)
         kw['obstacle_clearance_fn'] = _hook_for(rules, rep_p, in_i, explicit_flags,
-                                                partners=(rep_n,))
+                                                n_layers, partners=(rep_n,))
         extra = ''
         if kw.get('diff_pair_intra_match'):
             extra = (f", diff_pair_intra_match=True, "
@@ -394,5 +494,9 @@ def run_diff_with_rules(input_file: str, output_file: str, net_names: List[str],
         return 0, 0
     results = _run_chain(input_file, output_file, len(groups), route_group)
     totals = _print_summary(labels, results, "pairs")
-    _print_length_table(rules, output_file, pairs)
+    windows = [(n, pp.length_min, pp.length_max)
+               for _, p, nn, pp in pairs for n in (p, nn)]
+    _print_length_table(rules, output_file, windows,
+                        [(base, p, nn, pp.skew_max) for base, p, nn, pp in pairs],
+                        sorted(paired))
     return totals
