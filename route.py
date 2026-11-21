@@ -1909,6 +1909,13 @@ For differential pair routing, use route_diff.py:
     parser.add_argument("--display-time", type=float, default=0.0,
                         help="Seconds to display completed route before advancing (with --visualize --auto)")
 
+    parser.add_argument("--kicad-rules", action="store_true",
+                        help="Read track width, via size/drill and clearances from the board's "
+                             ".kicad_pro net classes and .kicad_dru rules; route nets group by "
+                             "rule group. Explicit --track-width/--clearance/--via-size/"
+                             "--via-drill still win. Implies --no-fix-drc-settings: the output "
+                             "gets the input's .kicad_pro/.kicad_dru unchanged.")
+
     from fab_tiers import (add_fab_tier_args, fab_tier_from_args, set_default_fab_tier,
                            enforce_fab_floors, count_copper_layers_in_file)
     add_fab_tier_args(parser)
@@ -2019,84 +2026,95 @@ For differential pair routing, use route_diff.py:
             print("Install pygame with: pip install pygame-ce")
             print("Continuing without visualization...")
 
-    batch_route(args.input_file, args.output_file, net_names,
-                direction_order=args.direction,
-                ordering_strategy=args.ordering,
-                disable_bga_zones=args.no_bga_zones,
-                rip_existing_nets=args.rip_existing_nets,
-                layers=args.layers,
-                track_width=args.track_width,
-                impedance=args.impedance,
-                power_nets=args.power_nets,
-                power_nets_widths=args.power_nets_widths,
-                power_tap_neckdown=not args.no_power_tap_neckdown,
-                neckdown_length=args.neckdown_length,
-                neckdown_taper_length=args.neckdown_taper_length,
-                clearance=args.clearance,
-                via_size=args.via_size,
-                via_drill=args.via_drill,
-                grid_step=args.grid_step,
-                via_cost=args.via_cost,
-                max_iterations=args.max_iterations,
-                max_probe_iterations=args.max_probe_iterations,
-                heuristic_weight=args.heuristic_weight,
-                turn_cost=args.turn_cost,
-                direction_preference_cost=args.direction_preference_cost,
-                bus_enabled=args.bus,
-                bus_detection_radius=args.bus_detection_radius,
-                bus_attraction_radius=args.bus_attraction_radius,
-                bus_attraction_bonus=args.bus_attraction_bonus,
-                bus_min_nets=args.bus_min_nets,
-                guide_corridor_enabled=args.guide_corridor,
-                guide_corridor_layer=args.guide_corridor_layer,
-                guide_corridor_spacing=args.guide_corridor_spacing,
-                keepout_enabled=args.keepout,
-                keepout_layer=args.keepout_layer,
-                proximity_heuristic_factor=args.proximity_heuristic_factor,
-                stub_proximity_radius=args.stub_proximity_radius,
-                stub_proximity_cost=args.stub_proximity_cost,
-                via_proximity_cost=args.via_proximity_cost,
-                bga_proximity_radius=args.bga_proximity_radius,
-                bga_proximity_cost=args.bga_proximity_cost,
-                track_proximity_distance=args.track_proximity_distance,
-                track_proximity_cost=args.track_proximity_cost,
-                debug_lines=args.debug_lines,
-                verbose=args.verbose,
-                max_rip_up_count=args.max_ripup,
-                ripup_abandon_metric=args.ripup_abandon_metric,
-                enable_layer_switch=not args.no_stub_layer_swap,
-                crossing_layer_check=not args.no_crossing_layer_check,
-                can_swap_to_top_layer=args.can_swap_to_top_layer,
-                swappable_net_patterns=args.swappable_nets,
-                crossing_penalty=args.crossing_penalty,
-                skip_routing=args.skip_routing,
-                routing_clearance_margin=args.routing_clearance_margin,
-                hole_to_hole_clearance=args.hole_to_hole_clearance,
-                board_edge_clearance=args.board_edge_clearance,
-                vertical_attraction_radius=args.vertical_attraction_radius,
-                vertical_attraction_cost=args.vertical_attraction_cost,
-                ripped_route_avoidance_radius=args.ripped_route_avoidance_radius,
-                ripped_route_avoidance_cost=args.ripped_route_avoidance_cost,
-                length_match_groups=args.length_match_groups,
-                length_match_tolerance=args.length_match_tolerance,
-                meander_amplitude=args.meander_amplitude,
-                time_matching=args.time_matching,
-                time_match_tolerance=args.time_match_tolerance,
-                debug_memory=args.debug_memory,
-                mps_reverse_rounds=args.mps_reverse_rounds,
-                mps_layer_swap=args.mps_layer_swap,
-                mps_segment_intersection=args.mps_segment_intersection,
-                vis_callback=vis_callback,
-                schematic_dir=args.schematic_dir,
-                layer_costs=args.layer_costs,
-                add_teardrops=args.add_teardrops,
-                collect_stats=args.stats)
+    route_kwargs = dict(
+        direction_order=args.direction,
+        ordering_strategy=args.ordering,
+        disable_bga_zones=args.no_bga_zones,
+        rip_existing_nets=args.rip_existing_nets,
+        layers=args.layers,
+        track_width=args.track_width,
+        impedance=args.impedance,
+        power_nets=args.power_nets,
+        power_nets_widths=args.power_nets_widths,
+        power_tap_neckdown=not args.no_power_tap_neckdown,
+        neckdown_length=args.neckdown_length,
+        neckdown_taper_length=args.neckdown_taper_length,
+        clearance=args.clearance,
+        via_size=args.via_size,
+        via_drill=args.via_drill,
+        grid_step=args.grid_step,
+        via_cost=args.via_cost,
+        max_iterations=args.max_iterations,
+        max_probe_iterations=args.max_probe_iterations,
+        heuristic_weight=args.heuristic_weight,
+        turn_cost=args.turn_cost,
+        direction_preference_cost=args.direction_preference_cost,
+        bus_enabled=args.bus,
+        bus_detection_radius=args.bus_detection_radius,
+        bus_attraction_radius=args.bus_attraction_radius,
+        bus_attraction_bonus=args.bus_attraction_bonus,
+        bus_min_nets=args.bus_min_nets,
+        guide_corridor_enabled=args.guide_corridor,
+        guide_corridor_layer=args.guide_corridor_layer,
+        guide_corridor_spacing=args.guide_corridor_spacing,
+        keepout_enabled=args.keepout,
+        keepout_layer=args.keepout_layer,
+        proximity_heuristic_factor=args.proximity_heuristic_factor,
+        stub_proximity_radius=args.stub_proximity_radius,
+        stub_proximity_cost=args.stub_proximity_cost,
+        via_proximity_cost=args.via_proximity_cost,
+        bga_proximity_radius=args.bga_proximity_radius,
+        bga_proximity_cost=args.bga_proximity_cost,
+        track_proximity_distance=args.track_proximity_distance,
+        track_proximity_cost=args.track_proximity_cost,
+        debug_lines=args.debug_lines,
+        verbose=args.verbose,
+        max_rip_up_count=args.max_ripup,
+        ripup_abandon_metric=args.ripup_abandon_metric,
+        enable_layer_switch=not args.no_stub_layer_swap,
+        crossing_layer_check=not args.no_crossing_layer_check,
+        can_swap_to_top_layer=args.can_swap_to_top_layer,
+        swappable_net_patterns=args.swappable_nets,
+        crossing_penalty=args.crossing_penalty,
+        skip_routing=args.skip_routing,
+        routing_clearance_margin=args.routing_clearance_margin,
+        hole_to_hole_clearance=args.hole_to_hole_clearance,
+        board_edge_clearance=args.board_edge_clearance,
+        vertical_attraction_radius=args.vertical_attraction_radius,
+        vertical_attraction_cost=args.vertical_attraction_cost,
+        ripped_route_avoidance_radius=args.ripped_route_avoidance_radius,
+        ripped_route_avoidance_cost=args.ripped_route_avoidance_cost,
+        length_match_groups=args.length_match_groups,
+        length_match_tolerance=args.length_match_tolerance,
+        meander_amplitude=args.meander_amplitude,
+        time_matching=args.time_matching,
+        time_match_tolerance=args.time_match_tolerance,
+        debug_memory=args.debug_memory,
+        mps_reverse_rounds=args.mps_reverse_rounds,
+        mps_layer_swap=args.mps_layer_swap,
+        mps_segment_intersection=args.mps_segment_intersection,
+        vis_callback=vis_callback,
+        schematic_dir=args.schematic_dir,
+        layer_costs=args.layer_costs,
+        add_teardrops=args.add_teardrops,
+        collect_stats=args.stats
+    )
+    if args.kicad_rules:
+        from kicad_rules_runner import run_route_with_rules
+        explicit_flags = {dest for dest in ('track_width', 'clearance', 'via_size', 'via_drill')
+                          if getattr(args, dest) != parser.get_default(dest)}
+        run_route_with_rules(args.input_file, args.output_file, net_names,
+                             route_kwargs, explicit_flags, batch_route_fn=batch_route)
+    else:
+        batch_route(args.input_file, args.output_file, net_names, **route_kwargs)
 
     # Make the written project's KiCad DRC constraints consistent with the
     # clearances/sizes we just routed to, so a manual DRC only flags genuine
     # problems instead of stock-default noise (issue #160). Only edits the
     # .kicad_pro, never the .kicad_pcb, so the board's KiCad version is preserved.
-    if not args.no_fix_drc_settings and not args.skip_routing \
+    # --kicad-rules implies --no-fix-drc-settings: the output keeps the input
+    # project's real rules (copied by the runner), never a loosened floor.
+    if not args.kicad_rules and not args.no_fix_drc_settings and not args.skip_routing \
             and args.output_file and os.path.isfile(args.output_file):
         try:
             import clearance_ledger
