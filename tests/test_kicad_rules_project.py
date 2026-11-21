@@ -46,3 +46,35 @@ def test_missing_file(tmp_path):
     r = load_project_rules(str(tmp_path / "none.kicad_pro"))
     assert r.classes == {} and r.warnings
     assert r.net_class("anything") == "Default"
+
+
+def test_garbled_list_json(tmp_path):
+    p = tmp_path / "x.kicad_pro"
+    p.write_text("[]")
+    r = load_project_rules(str(p))
+    assert r.classes == {} and r.warnings
+    assert r.net_class("a") == "Default"
+
+
+def test_binary_file(tmp_path):
+    p = tmp_path / "x.kicad_pro"
+    p.write_bytes(b"\xff\xfe\x00\x80\x81binary")
+    r = load_project_rules(str(p))
+    assert r.classes == {} and r.warnings
+
+
+def test_malformed_entries_warn(tmp_path):
+    import json
+    p = tmp_path / "x.kicad_pro"
+    p.write_text(json.dumps({"net_settings": {
+        "classes": ["bad", {"name": "Default", "clearance": True, "track_width": 0.2}],
+        "netclass_patterns": [{"netclass": "X"}, "junk"],
+        "netclass_assignments": ["nope"]}}))
+    r = load_project_rules(str(p))
+    assert r.classes["Default"].track_width == 0.2
+    assert r.classes["Default"].clearance is None
+    assert r.patterns == []
+    assert len(r.warnings) >= 4
+    p.write_text(json.dumps({"net_settings": 5, "board": []}))
+    r = load_project_rules(str(p))
+    assert r.warnings

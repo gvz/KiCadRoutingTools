@@ -5,7 +5,6 @@ minima from a .kicad_pro. All lengths are in mm.
 """
 import fnmatch
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -42,7 +41,7 @@ class ProjectRules:
     assignments: Dict[str, str] = field(default_factory=dict)
     board_min: Dict[str, float] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    _memo: Dict[str, str] = field(default_factory=dict, repr=False, compare=False)
+    _memo: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def net_class(self, net_name: str) -> str:
         """Explicit assignment, else first matching pattern, else "Default"."""
@@ -68,27 +67,55 @@ def load_project_rules(pro_path: str) -> ProjectRules:
     try:
         with open(pro_path, encoding='utf-8') as f:
             pro = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:
         rules.warnings.append(f"could not read project file '{pro_path}': {e}")
         return rules
 
-    ns = pro.get('net_settings') or {}
-    for c in ns.get('classes') or []:
+    def num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+    def section(parent, key, kind):
+        v = parent.get(key)
+        if v is None:
+            return kind()
+        if not isinstance(v, kind):
+            rules.warnings.append(
+                f"'{key}' in '{pro_path}' is not a {kind.__name__}; skipped")
+            return kind()
+        return v
+
+    if not isinstance(pro, dict):
+        rules.warnings.append(
+            f"project file '{pro_path}' is not a JSON object; ignored")
+        return rules
+
+    ns = section(pro, 'net_settings', dict)
+    for c in section(ns, 'classes', list):
+        if not isinstance(c, dict):
+            rules.warnings.append(f"skipped malformed netclass entry {c!r}")
+            continue
         name = c.get('name', 'Default')
-        vals = {k: c[k] for k in _CLASS_FIELDS if isinstance(c.get(k), (int, float))}
+        vals = {k: c[k] for k in _CLASS_FIELDS if num(c.get(k))}
         rules.classes[name] = NetClass(name=name, **vals)
         if name not in rules.class_order:
             rules.class_order.append(name)
 
-    for p in ns.get('netclass_patterns') or []:
-        if p.get('pattern') is not None and p.get('netclass'):
+    for p in section(ns, 'netclass_patterns', list):
+        if (isinstance(p, dict) and isinstance(p.get('pattern'), str)
+                and p.get('netclass')):
             rules.patterns.append((p['pattern'], p['netclass']))
+        else:
+            rules.warnings.append(f"skipped malformed netclass pattern entry {p!r}")
 
-    na = ns.get('netclass_assignments') or {}
-    if isinstance(na, dict):
-        rules.assignments = {k: v for k, v in na.items() if isinstance(v, str)}
+    na = section(ns, 'netclass_assignments', dict)
+    for k, v in na.items():
+        if isinstance(v, str):
+            rules.assignments[k] = v
+        else:
+            rules.warnings.append(f"skipped malformed netclass assignment for '{k}'")
 
-    board = ((pro.get('board') or {}).get('design_settings') or {}).get('rules') or {}
-    rules.board_min = {k: v for k, v in board.items()
-                       if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    board = section(pro, 'board', dict)
+    ds = section(board, 'design_settings', dict)
+    brules = section(ds, 'rules', dict)
+    rules.board_min = {k: v for k, v in brules.items() if num(v)}
     return rules
