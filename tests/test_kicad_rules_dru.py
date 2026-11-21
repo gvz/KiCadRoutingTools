@@ -72,3 +72,34 @@ def test_units():
     r = parse_dru('(rule "u" (constraint clearance (min 10mil) (opt 1in) (max 500um)))')[0]
     c = r.constraints["clearance"]
     assert (c.min, c.opt, c.max) == pytest.approx((0.254, 25.4, 0.5))
+
+
+def test_wildcard_brackets_literal_dru():
+    r = parse_dru('(rule "r" (condition "A.NetName == \'D[3]\'") (constraint clearance (min 0.2)))')[0]
+    assert eval_condition(r, ItemInfo("D[3]", "x"), None)
+    assert not eval_condition(r, ItemInfo("D3", "x"), None)
+    r = parse_dru('(rule "r" (condition "A.NetName == \'D?[*\'") (constraint clearance (min 0.2)))')[0]
+    assert eval_condition(r, ItemInfo("D1[abc", "x"), None)
+
+
+def test_wildcard_brackets_literal_pro(tmp_path):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from kicad_rules import load_project_rules
+    from kicad_rules_fixtures import write_pro
+    pro = write_pro(tmp_path, classes=[{"name": "Default"}, {"name": "BUS"}],
+                    patterns=[{"netclass": "BUS", "pattern": "DATA[3]"}])
+    assert load_project_rules(pro).net_class("DATA[3]") == "BUS"
+
+
+def test_deep_nesting_does_not_raise():
+    cond = "(" * 2000 + "A.NetClass == 'x'" + ")" * 2000
+    rules = parse_dru('(rule "deep" (condition "%s") (constraint clearance (min 1)))' % cond)
+    assert not rules[0].supported and "nested" in rules[0].reason
+    chain = " && ".join(["A.NetClass == 'x'"] * 5000)
+    r = parse_dru('(rule "chain" (condition "%s") (constraint clearance (min 1)))' % chain)[0]
+    assert eval_condition(r, ItemInfo("a", "x"), None) in (True, False)
+
+
+def test_failed_rule_keeps_uses_flags():
+    r = parse_dru('''(rule "f" (condition "A.NetName == 'a' && B.NetClass == 'b' && A.insideArea('z')") (constraint clearance (min 1)))''')[0]
+    assert not r.supported and r.uses_b and r.uses_netname

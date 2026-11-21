@@ -3,7 +3,6 @@
 Currently: net classes, pattern/explicit net assignments and Board Setup
 minima from a .kicad_pro. All lengths are in mm.
 """
-import fnmatch
 import json
 import re
 from dataclasses import dataclass, field
@@ -24,8 +23,18 @@ class NetClass:
     diff_pair_gap: Optional[float] = None
 
 
+def kicad_wildcard_match(name: str, pattern: str) -> bool:
+    """KiCad wildcard match: only '*' (any run) and '?' (one char) are special.
+
+    Case-sensitive, full-string; unlike fnmatch, '[...]' is literal.
+    """
+    regex = ''.join('.*' if c == '*' else '.' if c == '?' else re.escape(c)
+                    for c in pattern)
+    return re.fullmatch(regex, name, re.DOTALL) is not None
+
+
 def _pattern_matches(pattern: str, name: str) -> bool:
-    if fnmatch.fnmatchcase(name, pattern):
+    if kicad_wildcard_match(name, pattern):
         return True
     try:
         return re.fullmatch(pattern, name) is not None
@@ -241,12 +250,16 @@ def _tokenize_condition(cond: str):
     return toks
 
 
+_MAX_COND_DEPTH = 200
+
+
 class _CondParser:
     def __init__(self, toks):
         self.toks = toks
         self.i = 0
         self.uses_b = False
         self.uses_netname = False
+        self.depth = 0
 
     def peek(self):
         return self.toks[self.i] if self.i < len(self.toks) else (None, None)
@@ -284,15 +297,25 @@ class _CondParser:
         return node
 
     def not_(self):
-        if self.peek() == ('op', '!'):
-            self.i += 1
-            return ('not', self.not_())
-        return self.primary()
+        self.depth += 1
+        if self.depth > _MAX_COND_DEPTH:
+            raise _DruError("condition too deeply nested")
+        try:
+            if self.peek() == ('op', '!'):
+                self.i += 1
+                return ('not', self.not_())
+            return self.primary()
+        finally:
+            self.depth -= 1
 
     def primary(self):
         if self.peek() == ('op', '('):
             self.i += 1
+            self.depth += 1
+            if self.depth > _MAX_COND_DEPTH:
+                raise _DruError("condition too deeply nested")
             node = self.or_()
+            self.depth -= 1
             self.expect(')')
             return node
         kind, val = self.take()
@@ -328,6 +351,7 @@ class _CondParser:
 def _parse_rule(form: list) -> DruRule:
     name = form[1] if len(form) > 1 and isinstance(form[1], str) else ""
     rule = DruRule(name=name)
+    parser = None
     try:
         if not name:
             raise _DruError("rule has no name")
@@ -358,10 +382,14 @@ def _parse_rule(form: list) -> DruRule:
             rule._ast = parser.parse()
             rule.uses_b = parser.uses_b
             rule.uses_netname = parser.uses_netname
-    except _DruError as e:
+    except (_DruError, RecursionError) as e:
         rule.supported = False
-        rule.reason = str(e)
+        rule.reason = (str(e) if isinstance(e, _DruError)
+                       else "condition too deeply nested")
         rule._ast = None
+        if parser is not None:
+            rule.uses_b = parser.uses_b
+            rule.uses_netname = parser.uses_netname
     return rule
 
 
@@ -399,7 +427,7 @@ def _eval_node(node, items) -> bool:
     _, side, attr, pattern = node
     item = items[side]
     value = item.net_class if attr == 'NetClass' else item.net_name
-    return fnmatch.fnmatchcase(value, pattern)
+    return kicad_wildcard_match(value, pattern)
 
 
 def eval_condition(rule: DruRule, a: ItemInfo, b: Optional[ItemInfo]) -> bool:
@@ -411,4 +439,7 @@ def eval_condition(rule: DruRule, a: ItemInfo, b: Optional[ItemInfo]) -> bool:
         return False
     if rule._ast is None:
         return True
-    return _eval_node(rule._ast, {'A': a, 'B': b if b is not None else ItemInfo("", "")})
+    try:
+        return _eval_node(rule._ast, {'A': a, 'B': b if b is not None else ItemInfo("", "")})
+    except RecursionError:
+        return False
