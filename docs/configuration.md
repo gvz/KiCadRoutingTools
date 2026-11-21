@@ -475,16 +475,22 @@ python route.py my_board.kicad_pcb routed.kicad_pcb --kicad-rules --track-width 
   matching pattern wins; a net matching several is reported.
 - **Explicit assignments** (`netclass_assignments`) beat patterns. A net with
   neither gets the `Default` class.
-- **Board Setup `min_clearance`**: a floor. No pair of nets is routed closer
-  than this.
+- **Board Setup minima** are floors: `min_clearance` for every pair of nets,
+  `min_track_width` for track and diff-pair widths, `min_via_diameter` for
+  vias and `min_through_hole_diameter` for via drills. Each value raised to a
+  floor is reported ("floored to board minimum"). `min_copper_edge_clearance`
+  and `min_hole_to_hole` are passed as `--board-edge-clearance` and
+  `--hole-to-hole-clearance` unless you type those flags.
+- A project with no net classes (empty `net_settings`) gets a prominent
+  warning: every net is then routed with the command-line defaults.
 
 ### Supported `.kicad_dru` subset
 
 | Part | Supported |
 |------|-----------|
-| Conditions | `A.NetClass == 'X'`, `A.NetName == 'x'` (KiCad wildcards), `A.hasNetclass('X')`, the same for `B.`; combined with `&&`, `\|\|`, `!` and parentheses. Optional `(layer ...)`, `outer`, `inner` |
+| Conditions | `A.NetClass == 'X'`, `A.NetName == 'x'` (KiCad wildcards), `!=` for both, `A.hasNetclass('X')`, the same for `B.`; combined with `&&`, `\|\|`, `!` and parentheses |
 | Routing constraints | `clearance`, `track_width`, `via_diameter`, `hole_size`, `diff_pair_gap` |
-| Matching / report constraints | `skew`, `length` |
+| Matching / report constraints | `skew` (with or without `within_diff_pairs`), `length` |
 | Values | `min` / `opt` / `max`; the router uses `opt`, else `min`. Units `mm`, `mil`, `in`, `um` as KiCad accepts them |
 
 ### Precedence
@@ -493,9 +499,17 @@ python route.py my_board.kicad_pcb routed.kicad_pcb --kicad-rules --track-width 
 2. Otherwise the net's class value, then the `Default` class.
 3. The clearance between two nets is the larger of their two classes'
    clearances, overridden by the last matching two-object `clearance` rule.
-4. Nothing goes below the Board Setup `min_clearance`.
-5. Explicit CLI flags (`--track-width`, `--clearance`, `--via-size`,
-   `--via-drill`, ...) win over everything above; each override is printed.
+4. Nothing goes below the Board Setup minima (see above).
+5. A matching `track_width` rule also sets the minimum diff-pair width (KiCad
+   checks it on pair tracks too).
+6. Explicit CLI flags win over everything above; each override is printed. A
+   flag counts as explicit when it is typed on the command line, even with
+   its default value. Tracked flags:
+   - `route.py`: `--track-width`, `--clearance`, `--via-size`, `--via-drill`,
+     `--board-edge-clearance`, `--hole-to-hole-clearance`
+   - `route_diff.py`: the same, plus `--diff-pair-gap` and
+     `--length-match-tolerance` (and `--impedance`, which keeps its computed
+     width)
 
 Every rule that is not applied is listed at the start of the run.
 
@@ -509,16 +523,29 @@ group: a net from another group is treated as fixed.
 
 - The P and N nets may be in different classes; the pair takes the stricter
   (larger) of the two classes' values.
-- A `skew` rule turns on intra-pair matching, with the rule's maximum as the
-  tolerance. An explicit `--length-match-tolerance` still wins.
-- `length` rules are reported in a table after routing (pass or fail per
-  net). They are not enforced while routing.
+- A `skew` rule turns on intra-pair matching. The tolerance is the tightest
+  maximum of all skew rules matching the pair (a later, looser rule does not
+  replace a tighter one). An explicit `--length-match-tolerance` still wins.
+- If the pair gap is below the clearance between P and N, a warning names
+  both values: raise the gap or add a clearance rule for the pair.
+
+### Length and skew report
+
+After routing, both scripts print a table measured on the output board:
+
+- per-net length against the matching `length` rule (pass or fail; `route.py`
+  lists only nets with a length rule). Length rules are not enforced while
+  routing.
+- `route_diff.py`: the intra-pair skew of each pair against its tolerance.
+- For each `skew` rule without `within_diff_pairs`: the group skew (longest
+  minus shortest) across all routed nets the rule matches, against its maximum.
 
 ### Reported, not enforced (checked by DRC only)
 
 The router lists these but does not route to them:
 
-- `diff_pair_uncoupled`, `via_count`, `edge_clearance`, `hole_clearance`
+- for example `diff_pair_uncoupled`, `via_count`, `edge_clearance`,
+  `hole_clearance`, and any other constraint kind not listed above
 - layer-restricted rules
 - two-object rules for constraints other than `clearance`
 - constraints with only a `max` value
@@ -531,20 +558,28 @@ The input `.kicad_pro` and `.kicad_dru` are copied to the output unchanged.
 spec, so they are never loosened to match what was routed. Pairs are still
 found by net name; rules do not declare them.
 
+**Chains.** The fanout (`bga_fanout.py`, `qfn_fanout.py`), routing
+(`route.py`, `route_diff.py` without `--kicad-rules`) and planes
+(`route_planes.py`, `route_disconnected_planes.py`) steps rewrite the output
+project by default (`fix_kicad_drc_settings`), which can loosen non-default
+net classes. Run every step of a chain that feeds a `--kicad-rules` step with
+`--no-fix-drc-settings`, or regenerate the project files before the rules
+step. The fanout scripts have no `--no-fix-drc-settings` flag: after a fanout
+step, restore the original `.kicad_pro` (and `.kicad_dru`) beside its output
+before the rules step.
+
 ### Known limitations
 
-- A diff-pair partner-graze neck can shrink to the fab floor (0.0889 mm on 4+
-  layers), which is below the board's `min_track_width`. DRC may flag
-  `track_width` on such a pair.
-- Board Setup `min_track_width` is not yet applied as a floor.
+- A diff-pair partner-graze neck, and the single-ended terminal neck near
+  pads, can shrink a short segment to the fab floor (0.0889 mm on 4+ layers),
+  which can be below the board's `min_track_width`. DRC may flag
+  `track_width` on such a segment.
 - Some routing-loop checks still use the global clearance: restored-route
   collision checks, single-ended and diff-pair geometry snaps, diff-pair
   own-stub keep-outs and the `route_planes` via cache.
 - The length table counts all copper on the net, stubs and via barrels
   included, so it can read longer than KiCad's pad-to-pad length. Near a
   limit it can disagree with KiCad.
-- Typing a flag's default value (for example `--track-width 0.3`) does not
-  count as an explicit override.
 - One `JSON_SUMMARY` line is printed per group.
 - Intra-pair matching is not applied on some hybrid-escape routes; the skew
   table reports those as `FAIL`.
